@@ -1,3 +1,55 @@
+# llama-cpp-vega-retune
+
+A retune of llama.cpp for AMD Vega 20 (gfx906: Instinct MI50/MI60,
+Radeon VII / Pro VII). Adds a GCN weight-repacking GPU buffer type and
+DPP-based warp reductions, ported from the
+[reinstinct](https://github.com/sixvolts/reinstinct) inference engine
+where these techniques ship in production. Everything is measured on
+real hardware with cold-start A/B discipline and perplexity-validated
+against the canonical paths.
+
+Measured on an MI50 32 GB (1825 MHz sclk / 1125 MHz mclk / 300 W),
+`-fa 1`, vs the stock master this branch is based on (throughput in
+tok/s, llama-bench pp512 / tg128):
+
+| Model | stock pp / tg | retune pp / tg |
+|---|---:|---:|
+| Gemma 4 31B UD-Q4_K_XL (dense) | 186.7 / 22.4 | **220.3 / 27.9** (+18% / +24%) |
+| Qwen 3.6 35B-A3B UD-Q4_K_XL (MoE) | 864.4 / 89.9 | **967.9 / 89.9** (+12% / parity) |
+| Qwen 3.5 0.8B UD-Q4_K_XL | 4772 / 219.9 | **5324 / 220.3** (+12% / par) |
+
+What it does:
+
+- **Three-plane K-quant weight repack** (Q4_K/Q5_K/Q6_K, 2D and MoE
+  expert stacks): weights are transformed at load so the decode matvec
+  and the int8 MMQ prefill GEMM stream them fully coalesced on wave64
+  (the on-disk superblock layout caps a GCN matvec at ~58% of HBM
+  bandwidth; repacked sustains ~89%). dp4a (`v_dot4_i32_i8`)
+  throughout. On by default on GCN devices; `GGML_CUDA_REPACK=0`
+  disables it (required for `llama-quantize`/save: repacked weights
+  cannot be read back).
+- **DPP/ds_swizzle warp reductions** under the GCN define — single
+  VALU lane exchanges instead of `ds_bpermute` LDS roundtrips in every
+  warp reduction backend-wide.
+- **MoE (MUL_MAT_ID) support** with direct in-kernel expert routing at
+  decode and a grouped 16-token-tile GEMM for prefill.
+- `GGML_CUDA_REPACK_Q8_0=1` additionally repacks Q8_0 (prefill +43%,
+  decode -3% vs canonical — opt-in until retuned).
+
+Build (ROCm, gfx906):
+
+    cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 \
+          -DGGML_HIP_GRAPHS=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+
+Branch `gfx906-perf` carries the work as reviewable commits on top of
+upstream master (b9587 / 76da2450a, June 2026); each commit message
+includes its measured A/B numbers and validation. This repo is not
+affiliated with the upstream llama.cpp project — upstream README
+follows below.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
