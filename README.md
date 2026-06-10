@@ -8,6 +8,8 @@ where these techniques ship in production. Everything is measured on
 real hardware with cold-start A/B discipline and perplexity-validated
 against the canonical paths.
 
+
+
 Measured on an MI50 32 GB (1825 MHz sclk / 1125 MHz mclk / 300 W),
 `-fa 1`, vs the stock master this branch is based on (throughput in
 tok/s, llama-bench pp512 / tg128):
@@ -17,7 +19,7 @@ tok/s, llama-bench pp512 / tg128):
 | Gemma 4 31B UD-Q4_K_XL (dense) | 186.7 / 22.4 | **220.3 / 27.9** (+18% / +24%) |
 | Qwen 3.6 35B-A3B UD-Q4_K_XL (MoE) | 864.4 / 89.9 | **967.9 / 89.9** (+12% / parity) |
 | Qwen 3.5 0.8B UD-Q4_K_XL | 4772 / 219.9 | **5324 / 220.3** (+12% / par) |
-
+Significant improvements vs the iacopPBK-lineage gfx906 forks.
 What it does:
 
 - **Three-plane K-quant weight repack** (Q4_K/Q5_K/Q6_K, 2D and MoE
