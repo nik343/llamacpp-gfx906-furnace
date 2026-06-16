@@ -1406,6 +1406,39 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if defined(GGML_USE_HIP)
+// Plain-FMA tiled F32 GEMM, launched on GCN (gfx906) where rocBLAS on
+// ROCm 7.1 ships no gfx906 Tensile and the MMA-based mmf path needs
+// matrix cores gfx906 lacks, so the cublasSgemm(OP_T, OP_N) fallback has
+// no backend. Same contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
+// Generic code (no GCN intrinsics): compiled for all HIP builds, run only
+// when the runtime device is GCN.
+#define GCN_F32_TILE 16
+static __global__ void gcn_f32_gemm_tn(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    __shared__ float As[GCN_F32_TILE][GCN_F32_TILE];
+    __shared__ float Bs[GCN_F32_TILE][GCN_F32_TILE];
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int m = blockIdx.y * GCN_F32_TILE + ty;
+    const int n = blockIdx.x * GCN_F32_TILE + tx;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += GCN_F32_TILE) {
+        As[ty][tx] = (m < M && k0 + tx < K) ? A[(size_t) m * lda + (k0 + tx)] : 0.0f;
+        Bs[tx][ty] = (n < N && k0 + ty < K) ? B[(size_t) n * ldb + (k0 + ty)] : 0.0f;
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < GCN_F32_TILE; p++) {
+            acc += As[ty][p] * Bs[tx][p];
+        }
+        __syncthreads();
+    }
+    if (m < M && n < N) {
+        C[(size_t) m + (size_t) n * ldc] = acc;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1542,6 +1575,19 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+#if defined(GGML_USE_HIP)
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            const dim3 block(GCN_F32_TILE, GCN_F32_TILE);
+            const dim3 grid((ne11 + GCN_F32_TILE - 1) / GCN_F32_TILE,
+                            (ne01 + GCN_F32_TILE - 1) / GCN_F32_TILE);
+            gcn_f32_gemm_tn<<<grid, block, 0, main_stream>>>(
+                (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                (int) ne01, (int) ne11, (int) ne10,
+                (int) s01, (int) s11, (int) ne0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
