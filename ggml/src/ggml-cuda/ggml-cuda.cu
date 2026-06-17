@@ -5111,11 +5111,11 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     ggml_backend_cuda_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
     bool host_buffer = getenv("GGML_CUDA_NO_PINNED") == nullptr;
-#ifdef GGML_CUDA_NO_PEER_COPY
-    bool events = false;
-#else
+    // hipEvents do not require peer access; pipeline parallelism (and
+    // TurboPrefill) needs them. Decoupled from NO_PEER_COPY here so the
+    // no-P2P MI50s can pipeline -- cross-GPU copies still fall back to host
+    // staging under NO_PEER_COPY, the events only synchronize the stages.
     bool events = true;
-#endif
 
     props->caps = {
         /* .async                 = */ true,
