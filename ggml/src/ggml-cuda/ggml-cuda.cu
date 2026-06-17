@@ -4264,6 +4264,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// ===== GFXPROF: env-gated per-op GPU timing (export GFXPROF=1) =====
+// Serializes each op with HIP events to attribute GPU time per (op, src0
+// type, shape). No-op overhead-free when GFXPROF is unset. Measurement
+// aid only; not a production path.
+#include <mutex>
+#include <algorithm>
+namespace gfxprof {
+    static bool enabled() {
+        static int e = -1;
+        if (e < 0) { const char * s = getenv("GFXPROF"); e = (s && atoi(s)) ? 1 : 0; }
+        return e == 1;
+    }
+    struct Acc { double ms = 0; unsigned long long calls = 0; double mac = 0; };
+    static std::map<std::string, Acc> g_acc;
+    static std::mutex g_mtx;
+    static double node_mac(const ggml_tensor * node) {
+        const ggml_tensor * s0 = node->src[0];
+        const ggml_tensor * s1 = node->src[1];
+        if (node->op == GGML_OP_MUL_MAT && s0 && s1) {
+            return (double) s0->ne[0] * s0->ne[1] * s1->ne[1] * s1->ne[2] * s1->ne[3];
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && s0 && node->src[2]) {
+            return (double) s0->ne[0] * s0->ne[1] * (double) ggml_nelements(node->src[2]);
+        }
+        return 0;
+    }
+    static std::string key(const ggml_tensor * node) {
+        char buf[96];
+        const ggml_tensor * s0 = node->src[0];
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && s0) {
+            snprintf(buf, sizeof buf, "%-11s t%-2d %lldx%lld",
+                ggml_op_name(node->op), (int) s0->type,
+                (long long) s0->ne[0], (long long) s0->ne[1]);
+        } else {
+            snprintf(buf, sizeof buf, "%s", ggml_op_name(node->op));
+        }
+        return std::string(buf);
+    }
+    static void add(const ggml_tensor * node, float ms) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        Acc & a = g_acc[key(node)];
+        a.ms += ms; a.calls++; a.mac += node_mac(node);
+    }
+    struct Reporter { ~Reporter() {
+        if (!enabled() || g_acc.empty()) return;
+        std::vector<std::pair<std::string, Acc>> v(g_acc.begin(), g_acc.end());
+        std::sort(v.begin(), v.end(), [](const std::pair<std::string,Acc>&a, const std::pair<std::string,Acc>&b){ return a.second.ms > b.second.ms; });
+        double tot = 0; for (auto & p : v) tot += p.second.ms;
+        fprintf(stderr, "\n===== GFXPROF op breakdown (serialized GPU ms) =====\n");
+        fprintf(stderr, "%-26s %8s %10s %9s %9s %6s\n", "op type KxN", "calls", "tot_ms", "ms/call", "TMAC/s", "pct");
+        for (auto & p : v) {
+            Acc & a = p.second;
+            double tmac = (a.ms > 0 && a.mac > 0) ? (a.mac / (a.ms * 1e-3)) / 1e12 : 0;
+            fprintf(stderr, "%-26s %8llu %10.1f %9.4f %9.2f %6.1f\n",
+                p.first.c_str(), a.calls, a.ms, a.ms / (double) a.calls, tmac, 100.0 * a.ms / tot);
+        }
+        fprintf(stderr, "%-26s %8s %10.1f   (gfx906 int8 peak ~28 TMAC/s @1825MHz, 1 GPU)\n", "TOTAL", "", tot);
+    }};
+    static Reporter g_reporter;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4433,7 +4494,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok;
+                if (gfxprof::enabled()) {
+                    ggml_cuda_set_device(cuda_ctx->device);
+                    hipStream_t s = cuda_ctx->stream();
+                    hipEvent_t e0, e1;
+                    (void) hipEventCreate(&e0);
+                    (void) hipEventCreate(&e1);
+                    (void) hipEventRecord(e0, s);
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    (void) hipEventRecord(e1, s);
+                    (void) hipEventSynchronize(e1);
+                    float ms = 0; (void) hipEventElapsedTime(&ms, e0, e1);
+                    (void) hipEventDestroy(e0); (void) hipEventDestroy(e1);
+                    gfxprof::add(node, ms);
+                } else {
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
