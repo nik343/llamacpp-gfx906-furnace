@@ -1947,7 +1947,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
             ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, stream);
+            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
