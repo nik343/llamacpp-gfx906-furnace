@@ -1437,6 +1437,110 @@ static __global__ void gcn_f32_gemm_tn(
         C[(size_t) m + (size_t) n * ldc] = acc;
     }
 }
+
+// Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
+// all threads (float4 loads when the strides allow it), MT partial sums per thread,
+// then a wave reduction and a cross-wave LDS reduction per row. The 16x16 tile GEMM
+// leaves 12-15 of 16 tile rows idle and walks K serially for these shapes (qwen4exp
+// hc_*_inject [10240x4]: 0.7 ms -> 0.05 ms). One wave per column with a dependent
+// load loop is latency-bound (~0.8 ms), and above M=16 the per-thread A loads make
+// this slower than the tile GEMM (M=48: 0.6 ms vs 0.24 ms), so the tile keeps those.
+#define GCN_F32_SKINNY_MAX_M   16
+#define GCN_F32_SKINNY_THREADS 256
+
+template <int MT, bool VEC>
+static __global__ void gcn_f32_gemm_skinny(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_waves   = GCN_F32_SKINNY_THREADS / warp_size;
+    __shared__ float red[n_waves][MT];
+
+    const int n    = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+    const int wave = tid / warp_size;
+
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        acc[m] = 0.0f;
+    }
+
+    const float * b = B + (size_t) n * ldb;
+    if constexpr (VEC) {
+        const int K4 = K / 4;
+        for (int k4 = tid; k4 < K4; k4 += GCN_F32_SKINNY_THREADS) {
+            const float4 bv = *(const float4 *) (b + 4 * k4);
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m < M) {
+                    const float4 av = *(const float4 *) (A + (size_t) m * lda + 4 * k4);
+                    acc[m] += av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
+                }
+            }
+        }
+    } else {
+        for (int k = tid; k < K; k += GCN_F32_SKINNY_THREADS) {
+            const float bk = b[k];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m < M) {
+                    acc[m] += A[(size_t) m * lda + k] * bk;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        if (m < M) {
+            const float v = warp_reduce_sum<warp_size>(acc[m]);
+            if (lane == 0) {
+                red[wave][m] = v;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid < M) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < n_waves; ++w) {
+            s += red[w][tid];
+        }
+        C[(size_t) tid + (size_t) n * ldc] = s;
+    }
+}
+
+template <int MT>
+static void gcn_f32_gemm_skinny_launch_mt(
+        const float * A, const float * B, float * C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const bool vec, cudaStream_t stream) {
+    const dim3 block(GCN_F32_SKINNY_THREADS);
+    const dim3 grid(N);
+    if (vec) {
+        gcn_f32_gemm_skinny<MT, true><<<grid, block, 0, stream>>>(A, B, C, M, N, K, lda, ldb, ldc);
+    } else {
+        gcn_f32_gemm_skinny<MT, false><<<grid, block, 0, stream>>>(A, B, C, M, N, K, lda, ldb, ldc);
+    }
+}
+
+static void gcn_f32_gemm_skinny_launch(
+        const float * A, const float * B, float * C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        cudaStream_t stream) {
+    const bool vec = K % 4 == 0 && lda % 4 == 0 && ldb % 4 == 0 &&
+                     ((uintptr_t) A % 16 == 0) && ((uintptr_t) B % 16 == 0);
+    if (M <= 4) {
+        gcn_f32_gemm_skinny_launch_mt<4>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    } else if (M <= 8) {
+        gcn_f32_gemm_skinny_launch_mt<8>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    } else {
+        gcn_f32_gemm_skinny_launch_mt<16>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    }
+}
 #endif // defined(GGML_USE_HIP)
 
 template<ggml_type compute_type>
@@ -1577,6 +1681,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
 #if defined(GGML_USE_HIP)
         if (GGML_CUDA_CC_IS_GCN(cc)) {
+            if (ne01 <= GCN_F32_SKINNY_MAX_M) {
+                gcn_f32_gemm_skinny_launch(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10,
+                    (int) s01, (int) s11, (int) ne0, main_stream);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
             const dim3 block(GCN_F32_TILE, GCN_F32_TILE);
             const dim3 grid((ne11 + GCN_F32_TILE - 1) / GCN_F32_TILE,
                             (ne01 + GCN_F32_TILE - 1) / GCN_F32_TILE);
