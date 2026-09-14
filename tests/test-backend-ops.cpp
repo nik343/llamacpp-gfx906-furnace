@@ -11095,6 +11095,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp expert shapes (512 experts, 10 used), decode and prefill batch:
+    // gate/up [2560 -> 640] (K-quants possible), down [640 -> 2560] (K=640 is not a multiple of 256: 32-block types only)
+    for (int64_t n : {1, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+        }
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
