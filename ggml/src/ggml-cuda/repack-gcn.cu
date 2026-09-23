@@ -727,6 +727,86 @@ static __global__ void mul_mat_vec_q5_1_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Q5_1 repacked matvec for short rows (ne0 <= 1024, e.g. qwen4exp ffn_down_exps with K = 640): one lane
+// per sub-block, SEG lanes per row. The row-per-wave kernel above uses half-sub-block units that each
+// load the whole 16-byte nibble chunk (twice the weight traffic) and leaves lanes idle at this K.
+template <int SEG, bool HAS_IDS>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q5_1_repacked_seg(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const size_t expert_stride,
+        const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = blockIdx.y;
+        const uint32_t e = (uint32_t) ids_src1[a];
+        wbase += e * expert_stride;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+    } else {
+        GGML_UNUSED_VARS(ids_src1, expert_stride, xs_id, dst_s1);
+    }
+    constexpr int ROWS_PER_BLOCK = 256 / SEG;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint32_t * qhp = reinterpret_cast<const uint32_t *>(wbase + (size_t) ne1 * nsp * 16);
+    const half2    * dmp = reinterpret_cast<const half2 *>(wbase + (size_t) ne1 * nsp * 20);
+
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / SEG;
+    const uint32_t sb  = threadIdx.x % SEG;
+
+    float acc = 0.0f;
+    if (row < ne1 && sb < n_sub) {
+        const size_t   idx = (size_t) row * nsp + sb;
+        const uint4    q   = nib[idx];
+        const uint32_t qh  = qhp[idx];
+        const float2   dm  = __half22float2(dmp[idx]);
+        const block_q8_1 * xb = xq + sb;
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+        const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+        int idot = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu);
+            const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
+            idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
+            idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+        }
+        acc = dm.x * __low2float(xb->ds) * (float) idot + dm.y * __high2float(xb->ds);
+    }
+    acc = warp_reduce_sum<SEG>(acc);
+    if (sb == 0 && row < ne1) {
+        y[row] = acc;
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+template <bool HAS_IDS>
+static void launch_mul_mat_vec_q5_1_repacked_seg(
+        const uint8_t * w, const block_q8_1 * xq, float * y, const int64_t ne00, const int64_t ne01,
+        const int64_t n_slots, const int32_t * ids, const size_t expert_stride, const uint32_t xs_id,
+        const uint32_t dst_s1, cudaStream_t stream) {
+    const int64_t n_sub = ne00 / 32;
+    auto launch = [&](auto seg_c) {
+        constexpr int SEG = decltype(seg_c)::value;
+        const dim3 grid((ne01 + 256 / SEG - 1) / (256 / SEG), n_slots, 1);
+        mul_mat_vec_q5_1_repacked_seg<SEG, HAS_IDS><<<grid, 256, 0, stream>>>(
+            w, xq, y, (uint32_t) ne00, (uint32_t) ne01, ids, expert_stride, xs_id, dst_s1);
+    };
+    if (n_sub <= 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else if (n_sub <= 16) {
+        launch(std::integral_constant<int, 16>{});
+    } else {
+        launch(std::integral_constant<int, 32>{});
+    }
+}
+
 // Q6_K repacked matvec. Symmetric quant (value = q-32); the offset is
 // folded out via activation half-sums: sum (q-32)x = sum qx - 32 sum x.
 // Two signed scales per sub-block, one per 16 weights.
@@ -2222,6 +2302,10 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, 0, 0, 0, 0);
             } break;
             case GGML_TYPE_Q5_1: {
+                if (ne00 <= 1024) {
+                    launch_mul_mat_vec_q5_1_repacked_seg<false>(w, xq, dst_d, ne00, ne01, 1, nullptr, 0, 0, 0, stream);
+                    break;
+                }
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
                 mul_mat_vec_q5_1_repacked<false><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
@@ -2400,6 +2484,11 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q5_1: {
+                if (ne00 <= 1024) {
+                    launch_mul_mat_vec_q5_1_repacked_seg<true>(w, xq, dst_d, ne00, ne01, n_assign,
+                        (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1, stream);
+                    break;
+                }
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q5_1_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
