@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // ---------------------------------------------------------------------
@@ -941,6 +942,130 @@ static __global__ void mul_mat_vec_q3k_repacked(
 // 4-wave shape the K-quant matvecs use (NWAVES=4). ROWS=1 doubles the
 // wavefront count and wins at out_dim >= 4096 where ROWS=2 leaves too
 // few wavefront generations in flight to sustain HBM bandwidth.
+// Repacked Q8_0 matvec for short rows (ne0 <= 1024): one lane per 32-weight sub-block and SEG lanes
+// per row, so a wave covers 64/SEG rows. The one-row-per-wave kernel below leaves most lanes idle
+// when a row has few sub-blocks (qwen4exp hc up-projections, K = 320: 10 of 64 lanes busy, ~90 GB/s).
+template <int SEG, bool HAS_IDS>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_seg(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const size_t expert_stride,
+        const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = blockIdx.y;
+        const uint32_t e = (uint32_t) ids_src1[a];
+        wbase += e * expert_stride;
+        xq    += (size_t) a * xs_id;
+        y     += (size_t) a * dst_s1;
+    } else {
+        GGML_UNUSED_VARS(ids_src1, expert_stride, xs_id, dst_s1);
+    }
+    constexpr int ROWS_PER_BLOCK = 256 / SEG;
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+
+    const int4     * qs4     = reinterpret_cast<const int4 *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / SEG;
+    const uint32_t sb  = threadIdx.x % SEG;
+
+    float acc = 0.0f;
+    if (row < ne1 && sb < n_blocks) {
+        const block_q8_1 * xb = xq + sb;
+        const int4 * x4 = reinterpret_cast<const int4 *>(xb->qs);
+        const int4 w0 = qs4[((size_t) row * nsp + sb) * 2 + 0];
+        const int4 w1 = qs4[((size_t) row * nsp + sb) * 2 + 1];
+        const int4 a0 = x4[0];
+        const int4 a1 = x4[1];
+        int idot = 0;
+        idot = ggml_cuda_dp4a(w0.x, a0.x, idot);
+        idot = ggml_cuda_dp4a(w0.y, a0.y, idot);
+        idot = ggml_cuda_dp4a(w0.z, a0.z, idot);
+        idot = ggml_cuda_dp4a(w0.w, a0.w, idot);
+        idot = ggml_cuda_dp4a(w1.x, a1.x, idot);
+        idot = ggml_cuda_dp4a(w1.y, a1.y, idot);
+        idot = ggml_cuda_dp4a(w1.z, a1.z, idot);
+        idot = ggml_cuda_dp4a(w1.w, a1.w, idot);
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        acc = __half2float(*reinterpret_cast<const __half *>(&db)) * __low2float(xb->ds) * (float) idot;
+    }
+    acc = warp_reduce_sum<SEG>(acc);
+    if (sb == 0 && row < ne1) {
+        y[row] = acc;
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Repacked Q8_0 matvec for few long rows (non-ID): one 256-thread workgroup per row splits K over
+// all four waves and reduces through LDS. The row-per-wave kernels launch too few waves to load the
+// GPU when there are only a few hundred rows (qwen4exp hc down-projections, 320 rows x K = 10240).
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_splitk(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+
+    const uint32_t row = blockIdx.x;
+    float acc = 0.0f;
+    // work unit: a 16-weight half sub-block, as in the row-per-wave kernel
+    for (uint32_t hb = threadIdx.x; hb < n_blocks * 2; hb += 256) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const block_q8_1 * xb = xq + sb;
+        const int * xq32  = reinterpret_cast<const int *>(xb->qs) + half * 4;
+        const int * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
+        int idot = 0;
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
+        }
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        acc += __half2float(*reinterpret_cast<const __half *>(&db)) * __low2float(xb->ds) * (float) idot;
+    }
+    acc = warp_reduce_sum<64>(acc);
+    __shared__ float part[4];
+    if ((threadIdx.x & 63) == 0) {
+        part[threadIdx.x >> 6] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        y[row] = part[0] + part[1] + part[2] + part[3];
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+template <bool HAS_IDS>
+static void launch_mul_mat_vec_q8_0_repacked_seg(
+        const uint8_t * w, const block_q8_1 * xq, float * y, const int64_t ne00, const int64_t ne01,
+        const int64_t n_slots, const int32_t * ids, const size_t expert_stride, const uint32_t xs_id,
+        const uint32_t dst_s1, cudaStream_t stream) {
+    const int64_t n_blocks = ne00 / 32;
+    auto launch = [&](auto seg_c) {
+        constexpr int SEG = decltype(seg_c)::value;
+        const dim3 grid((ne01 + 256 / SEG - 1) / (256 / SEG), n_slots, 1);
+        mul_mat_vec_q8_0_repacked_seg<SEG, HAS_IDS><<<grid, 256, 0, stream>>>(
+            w, xq, y, (uint32_t) ne00, (uint32_t) ne01, ids, expert_stride, xs_id, dst_s1);
+    };
+    if (n_blocks <= 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else if (n_blocks <= 16) {
+        launch(std::integral_constant<int, 16>{});
+    } else {
+        launch(std::integral_constant<int, 32>{});
+    }
+}
+
 template <int ROWS, int NWAVES, bool HAS_IDS>
 static __global__ void mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
@@ -2103,6 +2228,16 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, 0, 0, 0, 0);
             } break;
             case GGML_TYPE_Q8_0: {
+                // short rows: several rows per wave (see mul_mat_vec_q8_0_repacked_seg)
+                if (ne00 <= 1024) {
+                    launch_mul_mat_vec_q8_0_repacked_seg<false>(w, xq, dst_d, ne00, ne01, 1, nullptr, 0, 0, 0, stream);
+                    break;
+                }
+                // few long rows: split K across a whole workgroup per row
+                if (ne01 <= 1024 && ne00 >= 4096) {
+                    mul_mat_vec_q8_0_repacked_splitk<<<ne01, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
+                    break;
+                }
                 // large ne01: single-wave ROWS=1 blocks maximize the
                 // wavefront count (measured on gfx906: ROWS=2 at
                 // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it). Small
@@ -2272,6 +2407,11 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q8_0: {
+                if (ne00 <= 1024) {
+                    launch_mul_mat_vec_q8_0_repacked_seg<true>(w, xq, dst_d, ne00, ne01, n_assign,
+                        (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1, stream);
+                    break;
+                }
                 if (ne01 >= 4096) {
                     const dim3 grid(ne01, n_assign, 1);
                     mul_mat_vec_q8_0_repacked<1, 1, true><<<grid, 64, 0, stream>>>(
