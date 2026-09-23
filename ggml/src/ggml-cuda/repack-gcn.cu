@@ -2597,21 +2597,13 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
-        case GGML_TYPE_Q4_K: {
-            static const bool q4k_old = getenv("GGML_CUDA_REPACK_Q4K_OLD") != nullptr;
-            if (q4k_old) {
-                mmq_gemm_q4k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
-                    (uint32_t) ne02, expert_stride, dst_s1);
-            } else {
-                static_assert(TN_ID == 1, "w1 kernel tiles 16 assignments");
-                mmq_gemm_q4k_repacked_id_w1<2><<<dim3((ne01 + 63) / 64, max_tiles, 1), 64, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
-                    (uint32_t) ne02, expert_stride, dst_s1);
-            }
-        } break;
+        case GGML_TYPE_Q4_K:
+            static_assert(TN_ID == 1, "w1 kernel tiles 16 assignments");
+            mmq_gemm_q4k_repacked_id_w1<2><<<dim3((ne01 + 63) / 64, max_tiles, 1), 64, 0, stream>>>(
+                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                (uint32_t) ne02, expert_stride, dst_s1);
+            break;
         case GGML_TYPE_Q5_K:
             mmq_gemm_q5k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
