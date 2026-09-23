@@ -2111,8 +2111,11 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
 
 // Q8_0 MMQ — 32 qs bytes per sub-block staged as two uint4s; no offset
 // term, so the accumulate is just dsc * dx * idot.
+// The dense instantiation runs 3 blocks/CU (84 VGPR cap, 3 x 20 KB LDS):
+// the next W step is prefetched into registers during the compute, and
+// the kk step is split into 16-byte halves to cut live operands.
 template <bool HAS_IDS, int TN_>
-static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
+static __global__ void __launch_bounds__(256, HAS_IDS ? 2 : 3) mmq_gemm_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok, const uint32_t x_stride,
@@ -2171,58 +2174,110 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
     const int lr = t >> 2;
     const int lk = t & 3;
 
-    // activation row for this thread's sX slot, resolved once
-    const bool xstage = lr < XR;
-    bool xval;
-    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    // Staging slot of this thread: weight row lr and activation row lr,
+    // sub-block lk of each BK step. Out-of-range rows and sub-blocks are
+    // clamped to valid addresses so the loads issue unmasked; no zeroing
+    // is needed: a clamped row only feeds outputs that are never stored,
+    // and a clamped sub-block is skipped by the K-tail check. Selecting
+    // on the loaded values would force an early vmcnt wait.
+    const bool     xstage = XR >= 64 || lr < XR; // lr < 64 always
+    // 32-bit element offsets against uniform bases keep one VGPR each
+    const uint32_t w_off = min(row0 + lr, ne1 - 1) * nsp;
+    uint32_t x_off;
     if constexpr (HAS_IDS) {
         const uint32_t a = a_base + lr;
-        xval = xstage && a < a_end;
-        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+        x_off = (xstage && a < a_end ? (uint32_t) ids_src1[a] : 0u) * x_stride;
     } else {
-        xval = xstage;
-        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+        x_off = min(tok0 + lr, n_tok - 1) * x_stride;
     }
 
-    for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
-        const uint32_t sb   = sb0 + lk;
-        const uint32_t wrow = row0 + lr;
-        if (wrow < ne1 && sb < n_sub) {
-            sW[lr][2 * lk]     = qsp[(size_t)(wrow * nsp + sb) * 2];
-            sW[lr][2 * lk + 1] = qsp[(size_t)(wrow * nsp + sb) * 2 + 1];
-            const uint16_t d_bits = dp[(size_t) wrow * nsp + sb];
-            sWd[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&d_bits));
-        } else {
-            sWd[lr][lk] = 0.0f;
-        }
+    // W of the next BK step is prefetched into registers; X is loaded at
+    // the top of its own step (prefetching it too spills at 84 VGPRs).
+    // Native vectors: HIP uint4 locals here would stay in scratch.
+    typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+    u32x4    pw_lo, pw_hi, px_a, px_b;
+    uint32_t pd, px_c;
+    auto gload_w = [&](const uint32_t sb0) {
+        const uint32_t wi = w_off + min(sb0 + lk, n_sub - 1);
+        pw_lo = reinterpret_cast<const u32x4 *>(qsp)[wi * 2];
+        pw_hi = reinterpret_cast<const u32x4 *>(qsp)[wi * 2 + 1];
+        pd    = dp[wi];
+    };
+    // X kept as loaded (d, qs[0..31] = 9 dwords), shuffled at the store
+    auto gload_x = [&](const uint32_t sb0) {
         if (xstage) {
-            if constexpr (!HAS_IDS) {
-                xval = tok0 + lr < n_tok;
-            }
-            if (xval && sb < n_sub) {
-                const block_q8_1 * xs;
-                if constexpr (HAS_IDS) {
-                    xs = xq + xoff + sb;
-                } else {
-                    xs = xq + (size_t) (tok0 + lr) * x_stride + sb;
-                }
-                const int * xi = reinterpret_cast<const int *>(xs);
-                int v[9];
-#pragma unroll
-                for (int i = 0; i < 9; i++) {
-                    v[i] = xi[i];
-                }
-                sXq[lr][2 * lk]     = make_uint4(v[1], v[2], v[3], v[4]);
-                sXq[lr][2 * lk + 1] = make_uint4(v[5], v[6], v[7], v[8]);
-                sXd[lr][lk] = __low2float(*reinterpret_cast<const half2 *>(&v[0]));
-            } else {
-                sXd[lr][lk] = 0.0f;
-            }
+            const uint32_t * xi = reinterpret_cast<const uint32_t *>(xq + (x_off + min(sb0 + lk, n_sub - 1)));
+            px_a = u32x4{xi[0], xi[1], xi[2], xi[3]};
+            px_b = u32x4{xi[4], xi[5], xi[6], xi[7]};
+            px_c = xi[8];
         }
+    };
+    auto lstore = [&]() {
+        reinterpret_cast<u32x4 *>(sW[lr])[2 * lk]     = pw_lo;
+        reinterpret_cast<u32x4 *>(sW[lr])[2 * lk + 1] = pw_hi;
+        const uint16_t d_bits = (uint16_t) pd;
+        sWd[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+        if (xstage) {
+            reinterpret_cast<u32x4 *>(sXq[lr])[2 * lk]     = u32x4{px_a.y, px_a.z, px_a.w, px_b.x};
+            reinterpret_cast<u32x4 *>(sXq[lr])[2 * lk + 1] = u32x4{px_b.y, px_b.z, px_b.w, px_c};
+            const uint16_t xd_bits = (uint16_t) px_a.x;
+            sXd[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&xd_bits));
+        }
+    };
+
+    gload_w(0);
+    for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
+        gload_x(sb0);
         __syncthreads();
+        lstore();
+        __syncthreads();
+        // unconditional: the last step reloads a clamped block, but a
+        // branch here makes the compiler wait on the loads at the join
+        gload_w(sb0 + MMQ_RP_BK);
 
         // K tail: skipped terms would add exactly +0.0f (scale 0)
         const int kk_end = min((int) MMQ_RP_BK, (int) (n_sub - sb0));
+        if constexpr (!HAS_IDS) {
+            // lo then hi 16-byte half; integer sums are order-free. The
+            // sched barriers stop the halves' LDS reads from being hoisted
+            // together, which spills at the 84 VGPR cap.
+#pragma unroll 1
+            for (int kk = 0; kk < kk_end; kk++) {
+                int idot[MMQ_RP_TM][TN_];
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    u32x4 wq[MMQ_RP_TM];
+#pragma unroll
+                    for (int r = 0; r < MMQ_RP_TM; r++) {
+                        wq[r] = reinterpret_cast<const u32x4 *>(sW[ty + r * 16])[2 * kk + h];
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                    for (int n = 0; n < TN_; n++) {
+                        const u32x4 xv = reinterpret_cast<const u32x4 *>(sXq[tx + n * 16])[2 * kk + h];
+#pragma unroll
+                        for (int r = 0; r < MMQ_RP_TM; r++) {
+                            int d = h ? idot[r][n] : 0;
+                            d = ggml_cuda_dp4a((int) wq[r].x, (int) xv.x, d);
+                            d = ggml_cuda_dp4a((int) wq[r].y, (int) xv.y, d);
+                            d = ggml_cuda_dp4a((int) wq[r].z, (int) xv.z, d);
+                            d = ggml_cuda_dp4a((int) wq[r].w, (int) xv.w, d);
+                            idot[r][n] = d;
+                        }
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+#pragma unroll
+                for (int n = 0; n < TN_; n++) {
+                    const float dx = sXd[tx + n * 16][kk];
+#pragma unroll
+                    for (int r = 0; r < MMQ_RP_TM; r++) {
+                        acc[r][n] += sWd[ty + r * 16][kk] * dx * (float) idot[r][n];
+                    }
+                }
+            }
+            continue;
+        }
 #pragma unroll
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
             if (kk >= kk_end) {
@@ -2257,8 +2312,8 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
                 }
             }
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     if constexpr (HAS_IDS) {
 #pragma unroll
