@@ -11100,6 +11100,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp prefill at ubatch 2048 (~40 tokens per expert, close to the trained router)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, 2048,  640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 2560, {1, 1}, {1, 1}));
     // qwen4exp expert shapes (512 experts, 10 used), decode and prefill batch:
     // gate/up [2560 -> 640] (K-quants possible), down [640 -> 2560] (K=640 is not a multiple of 256: 32-block types only)
     for (int64_t n : {1, 512}) {
