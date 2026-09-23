@@ -1593,6 +1593,17 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // host-staged device-to-device copies for GPUs without peer access (GGML_CUDA_NO_PEER_COPY),
+    // one pinned buffer per destination device, see ggml_cuda_copy_staged()
+    struct staged_copy {
+        void *      host     = nullptr;
+        size_t      size     = 0;
+        cudaEvent_t d2h_done = nullptr; // recorded on this (source) device
+        cudaEvent_t h2d_done = nullptr; // recorded on the destination device
+        bool        used     = false;
+    };
+    staged_copy staged[GGML_CUDA_MAX_DEVICES];
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

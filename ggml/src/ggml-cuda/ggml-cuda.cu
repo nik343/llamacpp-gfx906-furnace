@@ -706,6 +706,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (auto & st : staged) {
+        if (st.h2d_done != nullptr) {
+            CUDA_CHECK(cudaEventSynchronize(st.h2d_done));
+            CUDA_CHECK(cudaEventDestroy(st.h2d_done));
+        }
+        if (st.d2h_done != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(st.d2h_done));
+        }
+        if (st.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(st.host));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2731,6 +2743,56 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+#ifdef GGML_CUDA_NO_PEER_COPY
+// Device-to-device copy without peer access, kept asynchronous: D2H into a pinned buffer on the source
+// stream, then H2D on the destination stream after an event. The fallback the scheduler uses otherwise
+// (ggml_backend_tensor_copy) synchronizes the host and goes through pageable memory at every split.
+// The next copy through the same buffer first waits for the previous H2D to finish reading it.
+static bool ggml_cuda_copy_staged(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst,
+                                  const void * src_ptr, void * dst_ptr, const size_t nbytes) {
+    auto & st = ctx_src->staged[ctx_dst->device];
+
+    if (st.size < nbytes) {
+        if (st.used) {
+            CUDA_CHECK(cudaEventSynchronize(st.h2d_done));
+        }
+        if (st.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(st.host));
+            st.host = nullptr;
+            st.size = 0;
+        }
+        const size_t size = GGML_PAD(std::max(nbytes, (size_t) 4 << 20), (size_t) 1 << 20);
+        if (cudaHostAlloc(&st.host, size, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            st.host = nullptr;
+            return false;
+        }
+        st.size = size;
+        st.used = false;
+    }
+
+    ggml_cuda_set_device(ctx_src->device);
+    if (st.d2h_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&st.d2h_done, cudaEventDisableTiming));
+    }
+    if (st.used) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), st.h2d_done, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(st.host, src_ptr, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    CUDA_CHECK(cudaEventRecord(st.d2h_done, ctx_src->stream()));
+
+    ggml_cuda_set_device(ctx_dst->device);
+    if (st.h2d_done == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&st.h2d_done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), st.d2h_done, 0));
+    CUDA_CHECK(cudaMemcpyAsync(dst_ptr, st.host, nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    CUDA_CHECK(cudaEventRecord(st.h2d_done, ctx_dst->stream()));
+    st.used = true;
+    return true;
+}
+#endif // GGML_CUDA_NO_PEER_COPY
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2767,7 +2829,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
-            return false;
+            // the H2D is queued on the dst stream, so dst work is already ordered after it
+            static const bool no_staged = getenv("GGML_CUDA_NO_STAGED_COPY") != nullptr;
+            if (no_staged) {
+                return false;
+            }
+            return ggml_cuda_copy_staged(cuda_ctx_src, cuda_ctx_dst, src->data, dst->data, ggml_nbytes(dst));
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
