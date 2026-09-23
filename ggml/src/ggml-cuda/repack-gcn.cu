@@ -1289,7 +1289,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
-// Q5_K MMQ — Q4_K's tiles plus the qh plane staged alongside.
+// Q5_K MMQ - Q4_K's tiles; the qh plane is folded into int8 at LDS staging, as in the Q5_1 kernel.
 template <bool HAS_IDS, int TN_>
 static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
@@ -1330,8 +1330,8 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
     const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
         wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
 
-    __shared__ uint4      sW  [MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ uint32_t   sWqh[MMQ_RP_BM][MMQ_RP_BK];
+    // int8 weights per (row, sub-block), 5th bit folded in at staging (see the Q5_1 kernel)
+    __shared__ int        sW8 [MMQ_RP_BM][MMQ_RP_BK][8];
     __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK];
     __shared__ block_q8_1 sX  [(16 * TN_)][MMQ_RP_BK + 1];
 
@@ -1344,8 +1344,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
         const uint32_t sb   = sb0 + lk;
         const uint32_t wrow = row0 + lr;
         if (wrow < ne1 && sb < n_sub) {
-            sW  [lr][lk] = nib[(size_t) wrow * nsp + sb];
-            sWqh[lr][lk] = qhp[(size_t) wrow * nsp + sb];
+            const uint4    q  = nib[(size_t) wrow * nsp + sb];
+            const uint32_t qh = qhp[(size_t) wrow * nsp + sb];
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                sW8[lr][lk][j]     = (int) (( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu));
+                sW8[lr][lk][4 + j] = (int) (((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu));
+            }
             const uint16_t sm = smp[(size_t) wrow * nsp + sb];
             const uint32_t dd = ddp[(size_t) wrow * n_super + (sb >> 3)];
             const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
@@ -1354,6 +1360,10 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
                 __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm & 0xFFu),
                 __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8));
         } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                sW8[lr][lk][j] = 0;
+            }
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
         if (lr < (16 * TN_)) {
@@ -1374,16 +1384,6 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
 
 #pragma unroll
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
-            uint4 wq[MMQ_RP_TM]; uint32_t wqh[MMQ_RP_TM];
-            float dsc[MMQ_RP_TM], deff[MMQ_RP_TM];
-#pragma unroll
-            for (int r = 0; r < MMQ_RP_TM; r++) {
-                wq[r]  = sW  [ty + r * 16][kk];
-                wqh[r] = sWqh[ty + r * 16][kk];
-                const float2 s = sWs[ty + r * 16][kk];
-                dsc[r]  = s.x;
-                deff[r] = s.y;
-            }
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
                 const block_q8_1 * xb = &sX[tx + n * 16][kk];
@@ -1392,19 +1392,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
                 const float sx = __high2float(xb->ds);
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
-                    const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
-                    const uint32_t qh = wqh[r];
+                    const int * w8 = sW8[ty + r * 16][kk];
                     int idot = 0;
 #pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu)
-                            | repack_spread4((qh >> (8 * j))     & 0xFu);
-                        const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu)
-                            | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
-                        idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
-                        idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+                    for (int j = 0; j < 8; j++) {
+                        idot = ggml_cuda_dp4a(w8[j], xq32[j], idot);
                     }
-                    acc[r][n] += dsc[r] * dx * (float) idot - deff[r] * sx;
+                    const float2 s = sWs[ty + r * 16][kk];
+                    acc[r][n] += s.x * dx * (float) idot - s.y * sx;
                 }
             }
         }
@@ -1439,8 +1434,8 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
 }
 
 // Q5_1 MMQ. The 5th bit is folded into int8 once while staging the weight tile in LDS: doing it
-// per dp4a in the inner loop (as the Q5_K kernel does) repeats the unpack for every token column
-// and made the kernel ALU-bound, 1.5x slower than the canonical MMQ. x = d*q + m, so the min adds.
+// per dp4a in the inner loop repeats the unpack for every token column and made the kernel
+// ALU-bound, 1.5x slower than the canonical MMQ. x = d*q + m, so the min adds.
 template <bool HAS_IDS, int TN_>
 static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
