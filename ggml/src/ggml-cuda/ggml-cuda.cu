@@ -1407,42 +1407,99 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 #if defined(GGML_USE_HIP)
-// Plain-FMA tiled F32 GEMM, launched on GCN (gfx906) where rocBLAS on
-// ROCm 7.1 ships no gfx906 Tensile and the MMA-based mmf path needs
-// matrix cores gfx906 lacks, so the cublasSgemm(OP_T, OP_N) fallback has
-// no backend. Same contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
-// Generic code (no GCN intrinsics): compiled for all HIP builds, run only
-// when the runtime device is GCN.
-#define GCN_F32_TILE 16
-static __global__ void gcn_f32_gemm_tn(
+// F32 GEMMs launched on GCN (gfx906), where rocBLAS on ROCm 7.1 ships no gfx906 Tensile for
+// some shapes and the MMA-based mmf path needs matrix cores gfx906 lacks.
+// Contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
+// M > 16: 64x64 output tile per 256-thread block, 4x4 outputs per thread, K staged through LDS in
+// 16-wide slices stored k-major so the inner loop reads float4s. qwen4exp router [2560x512] at 2048
+// tokens: 3.2 TMAC/s (a plain 16x16 tile, one FMA per two LDS reads, managed 0.6).
+#define GCN_F32_RB_BM 64
+#define GCN_F32_RB_BN 64
+#define GCN_F32_RB_BK 16
+
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
         const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
         const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
-    __shared__ float As[GCN_F32_TILE][GCN_F32_TILE];
-    __shared__ float Bs[GCN_F32_TILE][GCN_F32_TILE];
-    const int tx = threadIdx.x, ty = threadIdx.y;
-    const int m = blockIdx.y * GCN_F32_TILE + ty;
-    const int n = blockIdx.x * GCN_F32_TILE + tx;
-    float acc = 0.0f;
-    for (int k0 = 0; k0 < K; k0 += GCN_F32_TILE) {
-        As[ty][tx] = (m < M && k0 + tx < K) ? A[(size_t) m * lda + (k0 + tx)] : 0.0f;
-        Bs[tx][ty] = (n < N && k0 + ty < K) ? B[(size_t) n * ldb + (k0 + ty)] : 0.0f;
+    __shared__ float As[GCN_F32_RB_BK][GCN_F32_RB_BM + 4];
+    __shared__ float Bs[GCN_F32_RB_BK][GCN_F32_RB_BN + 4];
+
+    const int tid = threadIdx.x;
+    const int tn  = tid % 16;
+    const int tm  = tid / 16;
+    const int m0  = blockIdx.y * GCN_F32_RB_BM;
+    const int n0  = blockIdx.x * GCN_F32_RB_BN;
+
+    // each thread loads 4 consecutive k of one row of A and one row of B per slice
+    const int lr = tid / 4;
+    const int lk = (tid % 4) * 4;
+
+    float acc[4][4] = {{0.0f}};
+
+    for (int k0 = 0; k0 < K; k0 += GCN_F32_RB_BK) {
+        const int k = k0 + lk;
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const int m = m0 + lr;
+        const int n = n0 + lr;
+        if (VEC && k + 3 < K) {
+            if (m < M) { a = *(const float4 *) (A + (size_t) m * lda + k); }
+            if (n < N) { b = *(const float4 *) (B + (size_t) n * ldb + k); }
+        } else {
+            if (m < M) {
+                a.x = k + 0 < K ? A[(size_t) m * lda + k + 0] : 0.0f;
+                a.y = k + 1 < K ? A[(size_t) m * lda + k + 1] : 0.0f;
+                a.z = k + 2 < K ? A[(size_t) m * lda + k + 2] : 0.0f;
+                a.w = k + 3 < K ? A[(size_t) m * lda + k + 3] : 0.0f;
+            }
+            if (n < N) {
+                b.x = k + 0 < K ? B[(size_t) n * ldb + k + 0] : 0.0f;
+                b.y = k + 1 < K ? B[(size_t) n * ldb + k + 1] : 0.0f;
+                b.z = k + 2 < K ? B[(size_t) n * ldb + k + 2] : 0.0f;
+                b.w = k + 3 < K ? B[(size_t) n * ldb + k + 3] : 0.0f;
+            }
+        }
+        As[lk + 0][lr] = a.x; As[lk + 1][lr] = a.y; As[lk + 2][lr] = a.z; As[lk + 3][lr] = a.w;
+        Bs[lk + 0][lr] = b.x; Bs[lk + 1][lr] = b.y; Bs[lk + 2][lr] = b.z; Bs[lk + 3][lr] = b.w;
         __syncthreads();
+
 #pragma unroll
-        for (int p = 0; p < GCN_F32_TILE; p++) {
-            acc += As[ty][p] * Bs[tx][p];
+        for (int kk = 0; kk < GCN_F32_RB_BK; ++kk) {
+            const float4 av = *(const float4 *) &As[kk][tm * 4];
+            const float4 bv = *(const float4 *) &Bs[kk][tn * 4];
+            const float ar[4] = {av.x, av.y, av.z, av.w};
+            const float br[4] = {bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += ar[i] * br[j];
+                }
+            }
         }
         __syncthreads();
     }
-    if (m < M && n < N) {
-        C[(size_t) m + (size_t) n * ldc] = acc;
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int n = n0 + tn * 4 + j;
+        if (n >= N) {
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int m = m0 + tm * 4 + i;
+            if (m < M) {
+                C[(size_t) m + (size_t) n * ldc] = acc[i][j];
+            }
+        }
     }
 }
 
 // Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
 // all threads (float4 loads when the strides allow it), MT partial sums per thread,
-// then a wave reduction and a cross-wave LDS reduction per row. The 16x16 tile GEMM
-// leaves 12-15 of 16 tile rows idle and walks K serially for these shapes (qwen4exp
-// hc_*_inject [10240x4]: 0.7 ms -> 0.05 ms). One wave per column with a dependent
+// then a wave reduction and a cross-wave LDS reduction per row. A 16x16 tile leaves most
+// rows idle and walks K serially for these shapes (qwen4exp hc_*_inject [10240x4]: 0.7 ms -> 0.05 ms). One wave per column with a dependent
 // load loop is latency-bound (~0.8 ms), and above M=16 the per-thread A loads make
 // this slower than the tile GEMM (M=48: 0.6 ms vs 0.24 ms), so the tile keeps those.
 #define GCN_F32_SKINNY_MAX_M   16
@@ -1689,13 +1746,19 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
-            const dim3 block(GCN_F32_TILE, GCN_F32_TILE);
-            const dim3 grid((ne11 + GCN_F32_TILE - 1) / GCN_F32_TILE,
-                            (ne01 + GCN_F32_TILE - 1) / GCN_F32_TILE);
-            gcn_f32_gemm_tn<<<grid, block, 0, main_stream>>>(
-                (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
-                (int) ne01, (int) ne11, (int) ne10,
-                (int) s01, (int) s11, (int) ne0);
+            const dim3 block(256);
+            const dim3 grid((ne11 + GCN_F32_RB_BN - 1) / GCN_F32_RB_BN, (ne01 + GCN_F32_RB_BM - 1) / GCN_F32_RB_BM);
+            const bool vec = s01 % 4 == 0 && s11 % 4 == 0 &&
+                (uintptr_t) src0_ptr % 16 == 0 && (uintptr_t) src1_ptr % 16 == 0;
+            if (vec) {
+                gcn_f32_gemm_tn_rb<true><<<grid, block, 0, main_stream>>>(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0);
+            } else {
+                gcn_f32_gemm_tn_rb<false><<<grid, block, 0, main_stream>>>(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0);
+            }
             CUDA_CHECK(cudaGetLastError());
             return;
         }
