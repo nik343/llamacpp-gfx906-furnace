@@ -166,6 +166,164 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Prefill variant for wave64 GPUs (S_v = 128, scalar gate). One 64-thread workgroup owns a 16-column
+// slab of one head's state and keeps it in LDS across all tokens; 4 lane groups of 16 split the k
+// dimension, reduced with two shuffles. The next token's q/k/v/g/beta are prefetched into registers
+// while the current one computes. All H * 8 workgroups are co-resident, so the serial token loop runs
+// once; one wave per column (the kernel above) leaves most of its waves queued behind the loop.
+// The slab is XOR-swizzled (element (c, kk) at c*128 + (kk ^ 2c)) so the 16 columns hit 16 banks.
+// Adapted from reinstinct's gdn_recurrent_batched_v2.
+#define GDN_LDS_HD 128
+
+// The workgroup is exactly one wave64 and a wave's LDS operations complete in order, so ordering the
+// compiler is enough. __syncthreads() would also wait for all outstanding global loads (its fence
+// drains vmcnt), stalling every token on the prefetch it is meant to hide.
+static __device__ __forceinline__ void gdn_wave_sync() {
+    __builtin_amdgcn_wave_barrier();
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
+template <int COLS, bool keep_rs_t>
+__global__ void __launch_bounds__(64) gated_delta_net_lds_wave64(
+        const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
+        const float * __restrict__ g, const float * __restrict__ beta,
+        const float * __restrict__ curr_state, float * __restrict__ dst, float * __restrict__ state,
+        const int64_t H, const int64_t n_tokens,
+        const int64_t sq1, const int64_t sq2, const int64_t sq3,
+        const int64_t sv1, const int64_t sv2, const int64_t sv3,
+        const int64_t sb1, const int64_t sb2, const int64_t sb3,
+        const uint3 neqk1_magic, const uint3 rq3_magic, const float scale,
+        const int64_t state_slot_stride, const int K) {
+    constexpr int HD    = GDN_LDS_HD;
+    constexpr int NG    = 64 / COLS;   // lane groups splitting the k dimension
+    constexpr int PER_G = HD / NG;     // k elements per thread
+    constexpr int PER_T = HD / 64;     // q/k elements each thread stages
+    static_assert(COLS * NG == 64 && HD % NG == 0, "bad slab width");
+
+    __shared__ float st[COLS * HD];
+    __shared__ float q_lds[HD];
+    __shared__ float k_lds[HD];
+
+    const uint32_t h         = blockIdx.x;
+    const uint32_t sequence  = blockIdx.y;
+    const int      tile_base = blockIdx.z * COLS;
+    const int      tid       = threadIdx.x;
+    const int      grp       = tid / COLS;
+    const int      lvv       = tid % COLS;
+    const int      col       = tile_base + lvv;
+    const int      swz       = 2 * lvv;
+
+    const uint32_t iq1 = fastmodulo(h, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    // state is [col][kk] (kk contiguous) per (seq, head)
+    const float * s_in  = curr_state + (int64_t) sequence * H * HD * HD + (int64_t) h * HD * HD;
+    float *       s_out = state + ((int64_t) sequence * H + h) * HD * HD;
+
+    for (int i = tid; i < COLS * HD; i += 64) {
+        const int c = i / HD, kk = i % HD;
+        st[c * HD + (kk ^ (2 * c))] = s_in[(int64_t) (tile_base + c) * HD + kk];
+    }
+
+    const float * q_base = q + iq3 * sq3 + iq1 * sq1;
+    const float * k_base = k + iq3 * sq3 + iq1 * sq1;
+    const float * v_base = v + sequence * sv3 + h * sv1 + col;
+    const int64_t gb     = sequence * sb3 + h * sb1;
+    float *       out    = dst + ((int64_t) sequence * n_tokens * H + h) * HD + col;
+
+    float pq[PER_T], pk[PER_T];
+#pragma unroll
+    for (int i = 0; i < PER_T; i++) {
+        pq[i] = q_base[tid + i * 64];
+        pk[i] = k_base[tid + i * 64];
+    }
+    float pv = v_base[0];
+    float pg = g[gb];
+    float pb = beta[gb];
+
+    float * st_col = st + lvv * HD;
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        gdn_wave_sync(); // token t-1 is done reading q/k
+#pragma unroll
+        for (int i = 0; i < PER_T; i++) {
+            q_lds[tid + i * 64] = pq[i];
+            k_lds[tid + i * 64] = pk[i];
+        }
+        const float v_t = pv, g_t = pg, b_t = pb;
+        {
+            const int64_t tn = t + 1 < n_tokens ? t + 1 : t;
+#pragma unroll
+            for (int i = 0; i < PER_T; i++) {
+                pq[i] = q_base[tn * sq2 + tid + i * 64];
+                pk[i] = k_base[tn * sq2 + tid + i * 64];
+            }
+            pv = v_base[tn * sv2];
+            pg = g[gb + tn * sb2];
+            pb = beta[gb + tn * sb2];
+        }
+        gdn_wave_sync();
+
+        const float decay = expf(g_t);
+
+        // kv = sum_kk (decay * S[kk][col]) * k[kk]
+        float s_arr[PER_G];
+        float pkv = 0.0f;
+#pragma unroll
+        for (int l = 0; l < PER_G; l++) {
+            const int kk = l * NG + grp;
+            const float sv = st_col[kk ^ swz] * decay;
+            s_arr[l] = sv;
+            pkv += sv * k_lds[kk];
+        }
+#pragma unroll
+        for (int off = COLS; off < 64; off <<= 1) {
+            pkv += __shfl_xor_sync(0xffffffffffffffffULL, pkv, off, 64);
+        }
+        const float delta = (v_t - pkv) * b_t;
+
+        // S[kk][col] = decay * S[kk][col] + k[kk] * delta; out = sum_kk S[kk][col] * q[kk]
+        float pout = 0.0f;
+#pragma unroll
+        for (int l = 0; l < PER_G; l++) {
+            const int kk = l * NG + grp;
+            const float sv = s_arr[l] + k_lds[kk] * delta;
+            st_col[kk ^ swz] = sv;
+            pout += sv * q_lds[kk];
+        }
+#pragma unroll
+        for (int off = COLS; off < 64; off <<= 1) {
+            pout += __shfl_xor_sync(0xffffffffffffffffULL, pout, off, 64);
+        }
+        if (grp == 0) {
+            out[t * HD * H] = pout * scale;
+        }
+
+        if constexpr (keep_rs_t) {
+            // slot 0 = most recent state, slot s = s tokens back (see the kernel above)
+            const int target_slot = (int) (n_tokens - 1 - t);
+            if (target_slot >= 0 && target_slot < K) {
+                gdn_wave_sync();
+                float * dst_state = s_out + target_slot * state_slot_stride;
+                for (int i = tid; i < COLS * HD; i += 64) {
+                    const int c = i / HD, kk = i % HD;
+                    dst_state[(int64_t) (tile_base + c) * HD + kk] = st[c * HD + (kk ^ (2 * c))];
+                }
+            }
+        }
+    }
+
+    gdn_wave_sync();
+    if constexpr (!keep_rs_t) {
+        for (int i = tid; i < COLS * HD; i += 64) {
+            const int c = i / HD, kk = i % HD;
+            s_out[(int64_t) (tile_base + c) * HD + kk] = st[c * HD + (kk ^ (2 * c))];
+        }
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -185,6 +343,21 @@ static void launch_gated_delta_net(
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+#if defined(GGML_USE_HIP)
+    if constexpr (!KDA) {
+        if (S_v == GDN_LDS_HD && n_tokens > 1 && warp_size == 64) {
+            constexpr int cols = 16; // 8: 1.3x slower (7.1 vs 5.6 ms at 2048 tokens, 48 heads)
+            const dim3 grid(H, n_seqs, GDN_LDS_HD / cols);
+            gated_delta_net_lds_wave64<cols, keep_rs_t><<<grid, 64, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
