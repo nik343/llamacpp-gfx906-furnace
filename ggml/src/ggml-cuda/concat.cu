@@ -139,6 +139,65 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim 0 with src1 a transposed view (nb[1] is the element stride): the src1 part is a transpose.
+// Stage it through a 64x64 LDS tile so both the read (along i1) and the write (along i0) coalesce.
+// qwen4exp builds each conv input this way: concat(conv_state, transpose(x), 0).
+#define CONCAT_TR_TILE 64
+#define CONCAT_TR_ROWS 4
+
+template <typename T>
+static __global__ void concat_dim0_copy_src0(
+        const char * __restrict__ src0, char * __restrict__ dst,
+        const int64_t ne00, const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.y;
+    const int64_t i3 = blockIdx.z;
+    for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
+        *(T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*sizeof(T)) = *(const T *) (src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    }
+}
+
+template <typename T>
+static __global__ void concat_dim0_transpose_src1(
+        const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const uint64_t nb10, const uint64_t nb12, const uint64_t nb13,
+        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    __shared__ T tile[CONCAT_TR_TILE][CONCAT_TR_TILE + 1];
+
+    // diagonal block order: consecutive blocks start on different src1 rows, which are a large
+    // power-of-two-ish stride apart and would otherwise pile onto the same memory channels
+    const int bx = (blockIdx.x + blockIdx.y) % gridDim.x;
+    const int by = blockIdx.y;
+
+    const int64_t i2 = blockIdx.z % ne12;
+    const int64_t i3 = blockIdx.z / ne12;
+    const int64_t t0 = (int64_t) bx * CONCAT_TR_TILE; // along src1 dim 0 (dst dim 0)
+    const int64_t c0 = (int64_t) by * CONCAT_TR_TILE; // along src1 dim 1 (dst dim 1)
+
+    const char * s = src1 + i3*nb13 + i2*nb12;
+#pragma unroll
+    for (int r = threadIdx.y; r < CONCAT_TR_TILE; r += CONCAT_TR_ROWS) {
+        const int64_t t = t0 + r;
+        const int64_t c = c0 + threadIdx.x;
+        if (t < ne10 && c < ne11) {
+            tile[r][threadIdx.x] = *(const T *) (s + t*nb10 + c*sizeof(T));
+        }
+    }
+    __syncthreads();
+
+    char * d = dst + i3*nb3 + i2*nb2;
+#pragma unroll
+    for (int r = threadIdx.y; r < CONCAT_TR_TILE; r += CONCAT_TR_ROWS) {
+        const int64_t c = c0 + r;
+        const int64_t t = t0 + threadIdx.x;
+        if (t < ne10 && c < ne11) {
+            *(T *) (d + c*nb1 + (ne00 + t)*sizeof(T)) = tile[threadIdx.x][r];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +219,25 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && !ggml_is_quantized(src0->type) &&
+               src0->nb[0] == sizeof(T) && dst->nb[0] == sizeof(T) &&
+               src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T) && src1->ne[1] > 1) {
+        if (src0->ne[0] > 0) {
+            const dim3 grid0(dst->ne[1], dst->ne[2], dst->ne[3]);
+            concat_dim0_copy_src0<T><<<grid0, 64, 0, stream>>>(
+                (const char *) src0->data, (char *) dst->data,
+                src0->ne[0], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                dst->nb[1], dst->nb[2], dst->nb[3]);
+        }
+        const dim3 block1(CONCAT_TR_TILE, CONCAT_TR_ROWS);
+        const dim3 grid1((src1->ne[0] + CONCAT_TR_TILE - 1) / CONCAT_TR_TILE,
+                         (src1->ne[1] + CONCAT_TR_TILE - 1) / CONCAT_TR_TILE,
+                         src1->ne[2] * src1->ne[3]);
+        concat_dim0_transpose_src1<T><<<grid1, block1, 0, stream>>>(
+            (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src1->ne[0], src1->ne[1], src1->ne[2],
+            src1->nb[0], src1->nb[2], src1->nb[3],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
