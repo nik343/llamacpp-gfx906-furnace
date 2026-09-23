@@ -1993,10 +1993,24 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
     const uint16_t * dp  = reinterpret_cast<const uint16_t *>(
         wbase + (size_t) ne1 * nsp * 32);
 
-    __shared__ uint4      sW_lo[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ uint4      sW_hi[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ float      sWd  [MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX   [(16 * TN_)][MMQ_RP_BK + 1];
+    // One raw LDS buffer with typed views. Rows of the qs planes are
+    // 2*BK+1 uint4 (144 B) so b128 reads with tx-distinct rows are
+    // conflict-free; slot 2*kk is qs[0..15], 2*kk+1 is qs[16..31].
+    // After the K loop the buffer is reused as the output tile.
+    constexpr int QS_LD  = 2 * MMQ_RP_BK + 1;
+    constexpr int XR     = 16 * TN_;
+    constexpr int Y_LD   = MMQ_RP_BM + 2; // 2tx+ty banks: conflict-free per half-wave
+    constexpr int OFF_XQ = MMQ_RP_BM * QS_LD * 16;
+    constexpr int OFF_WD = OFF_XQ + XR * QS_LD * 16;
+    constexpr int OFF_XD = OFF_WD + MMQ_RP_BM * MMQ_RP_BK * 4;
+    constexpr int SZ_K   = OFF_XD + XR * MMQ_RP_BK * 4;
+    constexpr int SZ_Y   = HAS_IDS ? 0 : XR * Y_LD * 4;
+    constexpr int SZ     = SZ_K > SZ_Y ? SZ_K : SZ_Y;
+    __shared__ uint4 smem[SZ / 16];
+    uint4 (*sW )[QS_LD]        = reinterpret_cast<uint4 (*)[QS_LD]>(smem);
+    uint4 (*sXq)[QS_LD]        = reinterpret_cast<uint4 (*)[QS_LD]>((char *) smem + OFF_XQ);
+    float (*sWd)[MMQ_RP_BK]    = reinterpret_cast<float (*)[MMQ_RP_BK]>((char *) smem + OFF_WD);
+    float (*sXd)[MMQ_RP_BK]    = reinterpret_cast<float (*)[MMQ_RP_BK]>((char *) smem + OFF_XD);
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -2004,7 +2018,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
     const int lk = t & 3;
 
     // activation row for this thread's sX slot, resolved once
-    const bool xstage = lr < (16 * TN_);
+    const bool xstage = lr < XR;
     bool xval;
     uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
     if constexpr (HAS_IDS) {
@@ -2020,8 +2034,8 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         const uint32_t sb   = sb0 + lk;
         const uint32_t wrow = row0 + lr;
         if (wrow < ne1 && sb < n_sub) {
-            sW_lo[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2];
-            sW_hi[lr][lk] = qsp[(size_t)(wrow * nsp + sb) * 2 + 1];
+            sW[lr][2 * lk]     = qsp[(size_t)(wrow * nsp + sb) * 2];
+            sW[lr][2 * lk + 1] = qsp[(size_t)(wrow * nsp + sb) * 2 + 1];
             const uint16_t d_bits = dp[(size_t) wrow * nsp + sb];
             sWd[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&d_bits));
         } else {
@@ -2032,32 +2046,49 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
                 xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
+                const block_q8_1 * xs;
                 if constexpr (HAS_IDS) {
-                    sX[lr][lk] = xq[xoff + sb];
+                    xs = xq + xoff + sb;
                 } else {
-                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                    xs = xq + (size_t) (tok0 + lr) * x_stride + sb;
                 }
+                const int * xi = reinterpret_cast<const int *>(xs);
+                int v[9];
+#pragma unroll
+                for (int i = 0; i < 9; i++) {
+                    v[i] = xi[i];
+                }
+                sXq[lr][2 * lk]     = make_uint4(v[1], v[2], v[3], v[4]);
+                sXq[lr][2 * lk + 1] = make_uint4(v[5], v[6], v[7], v[8]);
+                sXd[lr][lk] = __low2float(*reinterpret_cast<const half2 *>(&v[0]));
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sXd[lr][lk] = 0.0f;
             }
         }
         __syncthreads();
 
+        // K tail: skipped terms would add exactly +0.0f (scale 0)
+        const int kk_end = min((int) MMQ_RP_BK, (int) (n_sub - sb0));
 #pragma unroll
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
+            if (kk >= kk_end) {
+                break;
+            }
             uint4 wq_lo[MMQ_RP_TM], wq_hi[MMQ_RP_TM];
             float dsc[MMQ_RP_TM];
 #pragma unroll
             for (int r = 0; r < MMQ_RP_TM; r++) {
-                wq_lo[r] = sW_lo[ty + r * 16][kk];
-                wq_hi[r] = sW_hi[ty + r * 16][kk];
-                dsc[r]   = sWd  [ty + r * 16][kk];
+                wq_lo[r] = sW [ty + r * 16][2 * kk];
+                wq_hi[r] = sW [ty + r * 16][2 * kk + 1];
+                dsc[r]   = sWd[ty + r * 16][kk];
             }
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
-                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
+                const uint4 xa = sXq[tx + n * 16][2 * kk];
+                const uint4 xb = sXq[tx + n * 16][2 * kk + 1];
+                const float dx = sXd[tx + n * 16][kk];
+                const int xq32[8] = { (int) xa.x, (int) xa.y, (int) xa.z, (int) xa.w,
+                                      (int) xb.x, (int) xb.y, (int) xb.z, (int) xb.w };
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
                     const uint32_t lo[4] = { wq_lo[r].x, wq_lo[r].y, wq_lo[r].z, wq_lo[r].w };
@@ -2075,24 +2106,38 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         __syncthreads();
     }
 
+    if constexpr (HAS_IDS) {
 #pragma unroll
-    for (int r = 0; r < MMQ_RP_TM; r++) {
-        const uint32_t row = row0 + ty + r * 16;
-        if (row >= ne1) {
-            continue;
-        }
+        for (int r = 0; r < MMQ_RP_TM; r++) {
+            const uint32_t row = row0 + ty + r * 16;
+            if (row >= ne1) {
+                continue;
+            }
 #pragma unroll
-        for (int n = 0; n < TN_; n++) {
-            if constexpr (HAS_IDS) {
+            for (int n = 0; n < TN_; n++) {
                 const uint32_t a = a_base + tx + n * 16;
                 if (a < a_end) {
                     y[(size_t) ids_dst[a] * dst_s1 + row] = acc[r][n];
                 }
-            } else {
-                const uint32_t tok = tok0 + tx + n * 16;
-                if (tok < n_tok) {
-                    y[(size_t) tok * dst_s1 + row] = acc[r][n];
-                }
+            }
+        }
+    } else {
+        // transpose through LDS so each token row is stored contiguously
+        float (*tileY)[Y_LD] = reinterpret_cast<float (*)[Y_LD]>(smem);
+#pragma unroll
+        for (int r = 0; r < MMQ_RP_TM; r++) {
+#pragma unroll
+            for (int n = 0; n < TN_; n++) {
+                tileY[tx + n * 16][ty + r * 16] = acc[r][n];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int idx = t; idx < MMQ_RP_BM * XR; idx += 256) {
+            const int tok = idx / MMQ_RP_BM;
+            const int row = idx % MMQ_RP_BM;
+            if (tok0 + tok < n_tok && row0 + row < ne1) {
+                y[(size_t) (tok0 + tok) * dst_s1 + row0 + row] = tileY[tok][row];
             }
         }
     }
