@@ -388,39 +388,42 @@ static void repack_q5_1_host(const block_q5_1 * blocks, uint8_t * dst, const int
 // wbase + e * expert_stride (per-expert repacked slabs, identical
 // layout to the 2D case).
 
-// Largest e with expert_bounds[e] <= a.
-static __device__ __forceinline__ uint32_t repack_find_expert(
-        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert, const uint32_t a) {
-    uint32_t lo = 0, hi = n_expert;
-    while (lo + 1 < hi) {
-        const uint32_t mid = (lo + hi) >> 1;
-        if ((uint32_t) expert_bounds[mid] <= a) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-// tile_off[e] = prefix sum of per-expert token-tile counts (BN-sized
-// tiles); single-thread kernel, n_expert <= a few hundred.
+// tile_off[e] = exclusive prefix sum of per-expert token-tile counts
+// (BN-sized tiles), tile_off[n_expert] = total; tile_expert[tile] = the
+// expert owning that tile. One 1024-thread block, Hillis-Steele scan
+// over chunks of 1024 experts with a running carry.
 template <int BN>
-static __global__ void repack_tile_off(
+static __global__ void __launch_bounds__(1024, 1) repack_tile_map(
         const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_off,
-        const int n_expert) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
+        int32_t * __restrict__ tile_expert, const int n_expert) {
+    __shared__ int s[1024];
+    const int t = threadIdx.x;
+    int carry = 0;
+    for (int e0 = 0; e0 < n_expert; e0 += 1024) {
+        const int e   = e0 + t;
+        const int cnt = e < n_expert ? (expert_bounds[e + 1] - expert_bounds[e] + BN - 1) / BN : 0;
+        s[t] = cnt;
+        __syncthreads();
+        for (int off = 1; off < 1024; off <<= 1) {
+            const int v = t >= off ? s[t - off] : 0;
+            __syncthreads();
+            s[t] += v;
+            __syncthreads();
+        }
+        const int excl = carry + s[t] - cnt;
+        if (e < n_expert) {
+            tile_off[e] = excl;
+            for (int k = 0; k < cnt; k++) {
+                tile_expert[excl + k] = e;
+            }
+        }
+        carry += s[1023];
+        __syncthreads();
     }
-    int acc = 0;
-    tile_off[0] = 0;
-    for (int e = 0; e < n_expert; e++) {
-        const int cnt = expert_bounds[e + 1] - expert_bounds[e];
-        acc += (cnt + BN - 1) / BN;
-        tile_off[e + 1] = acc;
+    if (t == 0) {
+        tile_off[n_expert] = carry;
     }
 }
-
 
 // Repacked Q4_K matvec. Block = 256 threads = 4 wave64s; each wave
 // computes ROWS=2 output rows; lane l streams sub-block l, l+64, ... —
@@ -1142,14 +1145,17 @@ static __global__ void mul_mat_vec_q4k_repacked_glu(
 #define MMQ_RP_TN 4
 #define MMQ_RP_BM (16 * MMQ_RP_TM)
 #define MMQ_RP_BN (16 * MMQ_RP_TN)
+// MUL_MAT_ID instantiations (TN=1) are light enough for 4 waves/SIMD (64 VGPR cap)
+#define MMQ_RP_OCC_ID 4
 
 template <bool HAS_IDS, int TN_>
-static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
+static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_gemm_q4k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1162,14 +1168,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1188,6 +1194,21 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
     float acc[MMQ_RP_TM][TN_] = {};
 
     constexpr int LDW = MMQ_RP_BM * MMQ_RP_BK / 256; // tile elems per thread
+
+    // activation row for this thread's sX slot, resolved once
+    static_assert((16 * TN_) * MMQ_RP_BK <= 256, "sX staging assumes one slot per thread");
+    const int xlr = t / MMQ_RP_BK, xlk = t % MMQ_RP_BK;
+    const bool xstage = t < (16 * TN_) * MMQ_RP_BK;
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + xlr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
 
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
 #pragma unroll
@@ -1211,20 +1232,18 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
                 sWs[lr][lk] = make_float2(0.0f, 0.0f);
             }
         }
-        for (int e = t; e < (16 * TN_) * MMQ_RP_BK; e += 256) {
-            const int lr = e / MMQ_RP_BK, lk = e % MMQ_RP_BK;
-            const uint32_t sb = sb0 + lk;
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + xlr < n_tok;
             }
-            if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+            if (xval && sb0 + xlk < n_sub) {
+                if constexpr (HAS_IDS) {
+                    sX[xlr][xlk] = xq[xoff + sb0 + xlk];
+                } else {
+                    sX[xlr][xlk] = xq[(size_t) (tok0 + xlr) * x_stride + sb0 + xlk];
+                }
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[xlr][xlk].ds = make_half2(0.0f, 0.0f);
             }
         }
         __syncthreads();
@@ -1284,19 +1303,20 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q4k_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
 // Q5_K MMQ - Q4_K's tiles; the qh plane is folded into int8 at LDS staging, as in the Q5_1 kernel.
 template <bool HAS_IDS, int TN_>
-static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
+static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_gemm_q5k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1309,14 +1329,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1339,6 +1359,19 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
 
     const int lr = t >> 2;
     const int lk = t & 3;
+
+    // activation row for this thread's sX slot, resolved once
+    const bool xstage = lr < (16 * TN_);
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + lr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
 
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
         const uint32_t sb   = sb0 + lk;
@@ -1366,16 +1399,16 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
             }
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
-        if (lr < (16 * TN_)) {
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+                if constexpr (HAS_IDS) {
+                    sX[lr][lk] = xq[xoff + sb];
+                } else {
+                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                }
             } else {
                 sX[lr][lk].ds = make_half2(0.0f, 0.0f);
             }
@@ -1428,7 +1461,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -1437,12 +1470,13 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5k_repacked(
 // per dp4a in the inner loop repeats the unpack for every token column and made the kernel
 // ALU-bound, 1.5x slower than the canonical MMQ. x = d*q + m, so the min adds.
 template <bool HAS_IDS, int TN_>
-static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
+static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_gemm_q5_1_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1455,14 +1489,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1480,6 +1514,19 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
 
     const int lr = t >> 2;
     const int lk = t & 3;
+
+    // activation row for this thread's sX slot, resolved once
+    const bool xstage = lr < (16 * TN_);
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + lr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
 
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
         const uint32_t sb   = sb0 + lk;
@@ -1502,16 +1549,16 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
             }
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
-        if (lr < (16 * TN_)) {
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+                if constexpr (HAS_IDS) {
+                    sX[lr][lk] = xq[xoff + sb];
+                } else {
+                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                }
             } else {
                 sX[lr][lk].ds = make_half2(0.0f, 0.0f);
             }
@@ -1564,7 +1611,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q5_1_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -1578,6 +1625,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1590,14 +1638,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1621,6 +1669,19 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
     const int lr = t >> 2;
     const int lk = t & 3;
 
+    // activation row for this thread's sX slot, resolved once
+    const bool xstage = lr < (16 * TN_);
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + lr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
+
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
         const uint32_t sb   = sb0 + lk;
         const uint32_t wrow = row0 + lr;
@@ -1635,16 +1696,16 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
         } else {
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
-        if (lr < (16 * TN_)) {
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+                if constexpr (HAS_IDS) {
+                    sX[lr][lk] = xq[xoff + sb];
+                } else {
+                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                }
             } else {
                 sX[lr][lk].ds = make_half2(0.0f, 0.0f);
             }
@@ -1720,7 +1781,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -1734,6 +1795,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1746,14 +1808,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1777,6 +1839,19 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
     const int lr = t >> 2;
     const int lk = t & 3;
 
+    // activation row for this thread's sX slot, resolved once
+    const bool xstage = lr < (16 * TN_);
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + lr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
+
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
         const uint32_t sb   = sb0 + lk;
         const uint32_t wrow = row0 + lr;
@@ -1791,16 +1866,16 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
         } else {
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
-        if (lr < (16 * TN_)) {
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+                if constexpr (HAS_IDS) {
+                    sX[lr][lk] = xq[xoff + sb];
+                } else {
+                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                }
             } else {
                 sX[lr][lk].ds = make_half2(0.0f, 0.0f);
             }
@@ -1875,7 +1950,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -1889,6 +1964,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         const uint32_t n_tok, const uint32_t x_stride,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
+        const int32_t * __restrict__ tile_expert,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     const int t  = threadIdx.x;
@@ -1901,14 +1977,14 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         if (blockIdx.y >= (uint32_t) tile_off[n_expert]) {
             return;
         }
-        const uint32_t e = repack_find_expert(tile_off, n_expert, blockIdx.y);
+        const uint32_t e = (uint32_t) tile_expert[blockIdx.y];
         const uint32_t local_tile = blockIdx.y - (uint32_t) tile_off[e];
         a_base = (uint32_t) expert_bounds[e] + local_tile * (16 * TN_);
         a_end  = (uint32_t) expert_bounds[e + 1];
         wbase += e * expert_stride;
         tok0   = 0;
     } else {
-        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride);
+        GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride);
     }
 
     const uint32_t n_sub = ne0 >> 5;
@@ -1927,6 +2003,19 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
     const int lr = t >> 2;
     const int lk = t & 3;
 
+    // activation row for this thread's sX slot, resolved once
+    const bool xstage = lr < (16 * TN_);
+    bool xval;
+    uint32_t xoff; // block offset of the row in xq (32-bit: one VGPR)
+    if constexpr (HAS_IDS) {
+        const uint32_t a = a_base + lr;
+        xval = xstage && a < a_end;
+        xoff = (xval ? (uint32_t) ids_src1[a] : 0u) * x_stride;
+    } else {
+        xval = xstage;
+        xoff = 0; // dense: resolved per iteration (hoisting it costs VGPRs)
+    }
+
     for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
         const uint32_t sb   = sb0 + lk;
         const uint32_t wrow = row0 + lr;
@@ -1938,16 +2027,16 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         } else {
             sWd[lr][lk] = 0.0f;
         }
-        if (lr < (16 * TN_)) {
-            uint32_t xcol = tok0 + lr;
-            bool     xval = xcol < n_tok;
-            if constexpr (HAS_IDS) {
-                const uint32_t a = a_base + lr;
-                xval = a < a_end;
-                xcol = xval ? (uint32_t) ids_src1[a] : 0;
+        if (xstage) {
+            if constexpr (!HAS_IDS) {
+                xval = tok0 + lr < n_tok;
             }
             if (xval && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) xcol * x_stride + sb];
+                if constexpr (HAS_IDS) {
+                    sX[lr][lk] = xq[xoff + sb];
+                } else {
+                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                }
             } else {
                 sX[lr][lk].ds = make_half2(0.0f, 0.0f);
             }
@@ -2008,7 +2097,7 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q8_0_repacked(
         }
     }
 #else
-    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, n_expert, expert_stride, dst_s1);
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_expert, n_expert, expert_stride, dst_s1);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -2137,32 +2226,32 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         case GGML_TYPE_Q3_K:
             mmq_gemm_q3k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         case GGML_TYPE_Q4_K:
             mmq_gemm_q4k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         case GGML_TYPE_Q5_K:
             mmq_gemm_q5k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         case GGML_TYPE_Q6_K:
             mmq_gemm_q6k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         case GGML_TYPE_Q5_1:
             mmq_gemm_q5_1_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         case GGML_TYPE_Q8_0:
             mmq_gemm_q8_0_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
             break;
         default: GGML_ABORT("unsupported repack type");
     }
@@ -2294,47 +2383,49 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // batch: grouped tile GEMM, thin 16-token tiles (MoE routing spreads
     // tokens across experts; a 64-wide tile would be mostly empty)
     constexpr int TN_ID = 1;
-    ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool(), ne02 + 1);
-    repack_tile_off<16 * TN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), ne02);
     // over-launch upper bound: every expert can add one partial tile
     const int64_t max_tiles = n_assign / (16 * TN_ID) + ne02;
+    GGML_ASSERT(ne02 <= 4096);
+    ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<int32_t> tile_expert(ctx.pool(), max_tiles);
+    repack_tile_map<16 * TN_ID><<<1, 1024, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_expert.get(), ne02);
     const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM, max_tiles, 1);
 
     switch (src0->type) {
         case GGML_TYPE_Q3_K:
             mmq_gemm_q3k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q4_K:
             mmq_gemm_q4k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q5_K:
             mmq_gemm_q5k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q6_K:
             mmq_gemm_q6k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q5_1:
             mmq_gemm_q5_1_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q8_0:
             mmq_gemm_q8_0_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(),
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         default: GGML_ABORT("unsupported repack type");
