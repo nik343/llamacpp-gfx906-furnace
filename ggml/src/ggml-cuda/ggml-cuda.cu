@@ -1966,10 +1966,14 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
-    // GCN-repacked weights cannot go through the fused gate/up kernels
+    // GCN-repacked weights cannot go through the fused gate/up kernels; the
+    // plain gate/up/glu pattern has its own repacked kernel (ggml_cuda_try_fuse)
     if ((ffn_up->src[0]->buffer   && ggml_backend_buft_is_cuda_repack(ffn_up->src[0]->buffer->buft)) ||
         (ffn_gate->src[0]->buffer && ggml_backend_buft_is_cuda_repack(ffn_gate->src[0]->buffer->buft))) {
-        return false;
+        return !has_bias && !has_scale && glu->op == GGML_OP_GLU &&
+            glu->src[0] == ffn_gate && glu->src[1] == ffn_up && ffn_up->src[1] == ffn_gate->src[1] &&
+            ffn_up->src[2] == ffn_gate->src[2] && !ggml_get_op_params_i32(glu, 1) &&
+            ggml_cuda_repack_should_fuse_glu(ffn_up, ffn_gate, glu);
     }
 
     if (!is_mul_mat && !is_mul_mat_id) {
@@ -4612,6 +4616,16 @@ namespace gfxprof {
                 (long long) s0->ne[0], (long long) s0->ne[1]);
         } else {
             snprintf(buf, sizeof buf, "%s", ggml_op_name(node->op));
+        }
+        static const bool names = getenv("GFXPROF_NAMES") != nullptr;
+        if (names) {
+            // node name without the "-<layer>" suffix, e.g. "CONT [conv_input]"
+            std::string nm = node->name;
+            const size_t dash = nm.rfind('-');
+            if (dash != std::string::npos && nm.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
+                nm.resize(dash);
+            }
+            return std::string(buf) + " [" + nm + "]";
         }
         return std::string(buf);
     }
