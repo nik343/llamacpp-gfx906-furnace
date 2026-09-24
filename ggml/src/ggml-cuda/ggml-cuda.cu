@@ -2796,7 +2796,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET:
-            ggml_cuda_op_gated_delta_net(ctx, dst);
+            ggml_cuda_op_gated_delta_net(ctx, dst, ctx.cur_cgraph);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -4022,7 +4022,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy, cgraph);
             return nodes_to_skip;
         }
     }
@@ -4976,7 +4976,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // a recurrent-state gather read in place by its gated_delta_net
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_elidable(cgraph, node)) {
+                    continue;
+                }
+
                 ggml_cuda_repack_xq_invalidate(*cuda_ctx, node);
+                cuda_ctx->cur_cgraph = cgraph;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
