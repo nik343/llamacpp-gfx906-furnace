@@ -121,3 +121,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// dst = b + a * sigmoid(g), g [1, rows]; a, b, dst contiguous with the same shape
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * a,
+        const ggml_tensor * b, ggml_tensor * dst);

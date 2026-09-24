@@ -4409,6 +4409,36 @@ struct test_norm_scale_chain : public test_case {
     }
 };
 
+// b + a * sigmoid(g) with g one value per row (fused on some backends)
+struct test_sigmoid_mul_add : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_sigmoid_mul_add(std::array<int64_t, 4> ne = {2560, 1, 1, 1}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
+        ggml_set_name(g, "g");
+        ggml_tensor * out = ggml_add(ctx, b, ggml_mul(ctx, a, ggml_sigmoid(ctx, g)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9111,6 +9141,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_norm_scale_chain({4096, 5, 1, 1}, true));
     test_cases.emplace_back(new test_norm_scale_chain({320, 1, 1, 1}, false));
     test_cases.emplace_back(new test_norm_scale_chain({1000, 7, 3, 1}, false));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 1, 1, 1}));
+    test_cases.emplace_back(new test_sigmoid_mul_add({2560, 7, 1, 1}));
+    test_cases.emplace_back(new test_sigmoid_mul_add({333, 5, 3, 1}));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

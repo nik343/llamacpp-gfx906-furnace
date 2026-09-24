@@ -719,3 +719,24 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// y = b + a * sigmoid(g), g one value per row (qwen3next/qwen4exp shared-expert gate):
+// SIGMOID -> MUL -> ADD in one pass with the rounding of the three ops
+static __global__ void sigmoid_mul_add_f32(const float * a, const float * b, const float * g, float * dst,
+        const int64_t ncols, const int64_t n) {
+#pragma clang fp contract(off) // no fma: round the product like the separate MUL
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float s = op_sigmoid(g[i / ncols]);
+    dst[i] = b[i] + a[i] * s;
+}
+
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * a,
+        const ggml_tensor * b, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(dst);
+    const int64_t num_blocks = (n + CUDA_SIGMOID_BLOCK_SIZE - 1) / CUDA_SIGMOID_BLOCK_SIZE;
+    sigmoid_mul_add_f32<<<num_blocks, CUDA_SIGMOID_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) g->data, (float *) dst->data, dst->ne[0], n);
+}

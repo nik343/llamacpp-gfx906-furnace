@@ -3909,6 +3909,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // SIGMOID -> MUL -> ADD: b + a * sigmoid(g), g one value per row (shared-expert gate)
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add = cgraph->nodes[i + 2];
+        const ggml_tensor * g = node->src[0];
+        if (mul->op == GGML_OP_MUL && add->op == GGML_OP_ADD &&
+                (mul->flags & GGML_TENSOR_FLAG_COMPUTE) && (add->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (mul->src[0] == node || mul->src[1] == node) && (add->src[0] == mul || add->src[1] == mul) &&
+                ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i + 1, 1)) {
+            const ggml_tensor * a = mul->src[0] == node ? mul->src[1] : mul->src[0];
+            const ggml_tensor * b = add->src[0] == mul  ? add->src[1] : add->src[0];
+            const bool types = g->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32;
+            if (types && a != node && b != mul && g->ne[0] == 1 && ggml_is_contiguous(g) &&
+                    ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
+                    ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                    ggml_is_contiguous(add)) {
+                ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, g, a, b, add);
+                return 2;
+            }
+        }
+    }
+
     // SCALE -> SILU (qwen4exp hc mix)
     if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
