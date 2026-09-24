@@ -4007,7 +4007,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
             ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
-        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1],
+            ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, cgraph->nodes[i + 1]));
         return 1;
     }
 
@@ -4756,7 +4757,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, cgraph->nodes[i + 1]);
+        if (!ggml_cuda_op_rms_norm_fused_q8(*cuda_ctx, node, cgraph->nodes[i + 1], yq)) {
+            if (yq != nullptr) {
+                ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + 1], true);
+            }
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 

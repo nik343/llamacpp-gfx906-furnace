@@ -2834,17 +2834,63 @@ static bool repack_rc_reserve(ggml_cuda_repack_route_cache & rc, void ** buf, si
     return true;
 }
 
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force) {
     if (node->data == nullptr) {
         return;
     }
     const char * lo = (const char *) node->data;
     const char * hi = lo + ggml_nbytes(node);
     for (auto & e : ctx.repack_rc.xqc) {
-        if (e.gen == ctx.graph_gen && lo < e.hi && e.lo < hi) {
+        if (e.gen == ctx.graph_gen && (force || e.producer != node) && lo < e.hi && e.lo < hi) {
             e.gen = 0;
         }
     }
+}
+
+static const ggml_tensor * repack_view_root(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    static const bool disabled = getenv("GGML_CUDA_NO_Q8_EMIT") != nullptr;
+    if (disabled || cgraph == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+            ggml_nelements(t) % QK8_1 != 0) {
+        return nullptr;
+    }
+    bool consumer = false;
+    for (int i = 0; i < cgraph->n_nodes && !consumer; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT || !n->src[0]->buffer || !ggml_backend_buft_is_cuda_repack(n->src[0]->buffer->buft)) {
+            continue;
+        }
+        const ggml_tensor * x = n->src[1];
+        consumer = repack_view_root(x) == repack_view_root(t) && x->data == t->data && ggml_is_contiguous(x) &&
+            x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[0] <= ggml_nelements(t);
+    }
+    bool capturing = false;
+    if (!consumer || !repack_route_cache_usable(ctx, ctx.stream(), &capturing)) {
+        return nullptr;
+    }
+    ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+    auto & e = rc.xqc[rc.xqc_next];
+    rc.xqc_next = (rc.xqc_next + 1) % ggml_cuda_repack_route_cache::N_XQ;
+    e.gen = 0;
+    const size_t bytes = ggml_nelements(t) / QK8_1 * sizeof(block_q8_1);
+    if (!repack_rc_reserve(rc, (void **) &e.buf, &e.cap, bytes, capturing)) {
+        return nullptr;
+    }
+    e.gen      = ctx.graph_gen;
+    e.data     = t->data;
+    memset(e.ne, 0, sizeof(e.ne));
+    memset(e.nb, 0, sizeof(e.nb));
+    e.lo       = (const char *) t->data;
+    e.hi       = e.lo + ggml_nbytes(t);
+    e.producer = t;
+    e.flat_n   = ggml_nelements(t);
+    return e.buf;
 }
 
 // Quantize src1 (F32, dim0 dense) to q8_1 as [ne3][ne2][ne1][ne10_padded/QK8_1]
@@ -2867,9 +2913,13 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
         return (const block_q8_1 *) p;
     }
     ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+    const bool single_col = src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1);
     for (auto & e : rc.xqc) {
-        if (e.gen == ctx.graph_gen && e.data == src1->data &&
-                memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+        if (e.gen != ctx.graph_gen || e.data != src1->data) {
+            continue;
+        }
+        if (e.flat_n > 0 ? (single_col && src1->ne[0] <= e.flat_n) :
+                (memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0)) {
             return (const block_q8_1 *) e.buf;
         }
     }
@@ -2888,6 +2938,8 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
     memcpy(e.nb, src1->nb, sizeof(e.nb));
     e.lo = (const char *) src1->data;
     e.hi = e.lo + ggml_nbytes(src1);
+    e.producer = nullptr;
+    e.flat_n   = 0;
     return (const block_q8_1 *) e.buf;
 }
 

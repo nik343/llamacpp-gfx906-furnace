@@ -50,8 +50,13 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_tensor * dst);
 
 // Fused gate+up GLU decode path (Q4_K, dense and MoE).
+// q8_1 buffer for a producing kernel to fill alongside tensor t (flat 32-value blocks), when t
+// feeds a single-column repacked matvec; the consumer then skips its quantize. nullptr: don't emit
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t);
+
 // drop cached q8_1 activations whose source range node writes
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+// (force: also entries this node produced itself)
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false);
 
 bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
     const ggml_tensor * glu);

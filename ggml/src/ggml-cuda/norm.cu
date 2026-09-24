@@ -154,6 +154,67 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// q8_1 of one value per lane, 32 consecutive lanes = one block: the arithmetic of quantize_q8_1
+static __device__ __forceinline__ void rms_emit_q8_1(block_q8_1 * yq, const int64_t idx, const float v) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const int64_t ib  = idx / QK8_1;
+    const int     iqs = idx % QK8_1;
+    yq[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        yq[ib].ds = make_half2(d, sum);
+    }
+}
+
+// RMS_NORM -> MUL that also writes the result as q8_1 for a repacked matvec consumer
+// (see ggml_cuda_repack_xq_emit_target); ncols % 32 == 0, contiguous dst
+template <int block_size>
+static __global__ void rms_norm_mul_q8_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float * mul,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed,
+        const uint3 mul_nsamples_packed, block_q8_1 * yq) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t dst_off = ((int64_t)(sample*nchannels + channel)*nrows + row)*ncols;
+    dst += dst_off;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        const float v = scale * x[col] * mul[mul_col];
+        dst[col] = v;
+        rms_emit_q8_1(yq, dst_off + col, v);
+    }
+}
+
 // RMS_NORM -> SCALE (the GDN l2 norm): same rounding as the two ops
 template <int block_size>
 static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
@@ -592,6 +653,27 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * yq) {
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * mul_src = mul_tensor->src[0] == dst ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ne00 = src->ne[0];
+    if (yq == nullptr || ne00 % QK8_1 != 0 || ne00 < 1024 || !ggml_is_contiguous(mul_tensor) ||
+            !ggml_are_same_shape(mul_tensor, dst) || src->nb[0] != sizeof(float) || mul_src->nb[0] != sizeof(float) ||
+            mul_src->type != GGML_TYPE_F32) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    const dim3 blocks_num(src->ne[1], src->ne[2], src->ne[3]);
+    rms_norm_mul_q8_f32<1024><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+        src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+        (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+        init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+        init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+    return true;
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

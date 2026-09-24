@@ -1618,8 +1618,12 @@ struct ggml_cuda_repack_route_cache {
         const char * lo = nullptr, * hi = nullptr;
         char       * buf = nullptr;
         size_t       cap = 0;
+        // written by the producing kernel (ggml_cuda_repack_xq_emit_target): flat q8_1 blocks
+        // of a contiguous tensor, valid for single-column consumers reading <= flat_n values
+        const ggml_tensor * producer = nullptr;
+        int64_t             flat_n   = 0;
     };
-    static constexpr int N_XQ = 4;
+    static constexpr int N_XQ = 8;
     xq_entry xqc[N_XQ];
     int      xqc_next = 0;
 
