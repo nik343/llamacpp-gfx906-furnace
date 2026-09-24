@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "repack-gcn.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -116,13 +117,14 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        block_q8_1 * yq) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
 
     if (ir >= nr) {
-        return;
+        return; // with yq, nr % 32 == 0: whole 32-lane groups leave together
     }
 
     ggml_cuda_pdl_sync();
@@ -142,7 +144,22 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float v = scale * sum;
+    dst[i0*sd0 + it*sd1] = v;
+
+    if (yq != nullptr) {
+        // q8_1 of the (contiguous) result for a repacked matvec consumer; the arithmetic of quantize_q8_1
+        float amax = fabsf(v);
+        float bsum = v;
+        amax = warp_reduce_max<QK8_1>(amax);
+        bsum = warp_reduce_sum<QK8_1>(bsum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+        yq[ir / QK8_1].qs[ir % QK8_1] = q;
+        if (ir % QK8_1 == 0) {
+            yq[ir / QK8_1].ds = make_half2(d, bsum);
+        }
+    }
 }
 
 // act: post holds the raw injection and the weight is s_out * sigmoid(s_in * post), the
@@ -270,6 +287,11 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
+    block_q8_1 * yq = nullptr;
+    if (nbd0 == sizeof(float) && nbd1 == n_embd * sizeof(float) && nr % QK8_1 == 0) {
+        yq = (block_q8_1 *) ggml_cuda_repack_xq_emit_target(ctx, ctx.cur_cgraph, dst);
+    }
+
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
@@ -277,7 +299,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, yq);
 }
 
 static void ggml_cuda_op_dsv4_hc_post_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
