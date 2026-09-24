@@ -3905,6 +3905,35 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // try and fuse nodes and return the number of nodes to skip
 
 
+// Element-wise fusions: an input may be the fused output itself (in-place, same
+// layout: every element is read before the same thread writes it); any other
+// overlap between the output and an input disables the fusion.
+static bool ggml_cuda_fusion_inputs_ok(const ggml_tensor * dst, std::initializer_list<const ggml_tensor *> same_index,
+        std::initializer_list<const ggml_tensor *> strict) {
+    auto range = [](const ggml_tensor * t, int64_t & a, int64_t & b) {
+        a = (int64_t) t->data;
+        b = a + (int64_t) ggml_nbytes(t);
+    };
+    int64_t d0, d1;
+    range(dst, d0, d1);
+    auto overlaps = [&](const ggml_tensor * t) {
+        int64_t a, b;
+        range(t, a, b);
+        return a < d1 && d0 < b;
+    };
+    for (const ggml_tensor * t : same_index) {
+        if (overlaps(t) && !(t->data == dst->data && ggml_are_same_shape(t, dst) && ggml_are_same_stride(t, dst))) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : strict) {
+        if (overlaps(t)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3930,7 +3959,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (types && a != node && b != mul && g->ne[0] == 1 && ggml_is_contiguous(g) &&
                     ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
                     ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
-                    ggml_is_contiguous(add) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, std::array<int, 1>{ i + 2 }.data(), 1)) {
+                    ggml_is_contiguous(add) && ggml_cuda_fusion_inputs_ok(add, { a, b }, { g })) {
                 ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, g, a, b, add);
                 return 2;
             }
@@ -3940,14 +3969,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // SCALE -> SILU (qwen4exp hc mix)
     if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
-            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, std::array<int, 1>{ i + 1 }.data(), 1)) {
+            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
         ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
     // RMS_NORM -> SCALE (GDN l2 norm)
     if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
-            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, std::array<int, 1>{ i + 1 }.data(), 1)) {
+            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
