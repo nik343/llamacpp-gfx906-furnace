@@ -3806,6 +3806,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (qwen4exp hc combine weights): computed inside hc_post
+    if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE })) {
+        ggml_tensor * sig  = cgraph->nodes[i + 1];
+        ggml_tensor * sc2  = cgraph->nodes[i + 2];
+        ggml_tensor * post = cgraph->nodes[i + 3];
+        float s_in, b_in, s_out, b_out;
+        memcpy(&s_in,  (const float *) node->op_params + 0, sizeof(float));
+        memcpy(&b_in,  (const float *) node->op_params + 1, sizeof(float));
+        memcpy(&s_out, (const float *) sc2->op_params + 0, sizeof(float));
+        memcpy(&b_out, (const float *) sc2->op_params + 1, sizeof(float));
+        if (ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && b_in == 0.0f && b_out == 0.0f &&
+                post->op == GGML_OP_DSV4_HC_POST && post->src[2] == sc2 && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
+                node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_stride(node->src[0], sc2)) {
+            ggml_cuda_op_dsv4_hc_post_act(*cuda_ctx, post, node->src[0], s_in, s_out);
+            return 3;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
