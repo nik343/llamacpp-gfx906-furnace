@@ -1608,6 +1608,21 @@ struct ggml_cuda_repack_route_cache {
     char  * xq     = nullptr;
     size_t  xq_cap = 0;
 
+    // decode activation cache: q8_1 copies of recently quantized src1, reused while
+    // no node has written their range (ggml_cuda_repack_xq_invalidate)
+    struct xq_entry {
+        uint64_t     gen  = 0;
+        const void * data = nullptr;
+        int64_t      ne[4] = {};
+        size_t       nb[4] = {};
+        const char * lo = nullptr, * hi = nullptr;
+        char       * buf = nullptr;
+        size_t       cap = 0;
+    };
+    static constexpr int N_XQ = 4;
+    xq_entry xqc[N_XQ];
+    int      xqc_next = 0;
+
     std::vector<void *> retired;
 };
 

@@ -1332,6 +1332,74 @@ static __global__ void mul_mat_vec_q4k_repacked_glu(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Dense Q8_0 gate+up matvec with GLU epilogue (the shared-expert FFN):
+// mul_mat_vec_q8_0_repacked<ROWS, 4> walking both weight slabs per unit.
+template <int ROWS>
+static __global__ void mul_mat_vec_q8_0_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+
+    const uint8_t * wb[2] = { wup, wgate };
+
+    const int wave = threadIdx.x >> 6;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const int lane = threadIdx.x & 63;
+
+    float acc[2][ROWS] = {};
+
+    const uint32_t n_half = n_blocks * 2;
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs) + half * 4;
+
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const int      * qs_int  = reinterpret_cast<const int *>(wb[w2]);
+            const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 32);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int row = row0 + r;
+                if (row >= (int) ne1) {
+                    continue;
+                }
+                const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
+                const uint16_t   db    = d_plane[(size_t) row * nsp + sb];
+                const float      dw    = __half2float(*reinterpret_cast<const __half *>(&db));
+
+                int idot = 0;
+#pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
+                }
+                acc[w2][r] += dw * dx * (float) idot;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_v   = warp_reduce_sum<64>(acc[0][r]);
+        const float gate_v = warp_reduce_sum<64>(acc[1][r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // int8 MMQ tile GEMM straight from the repacked planes (prefill path).
 // Y[tok, row] = Xq8[tok, :] . W[row, :] without dequantizing W.
 //
@@ -2570,6 +2638,9 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
         int64_t x_stride, cudaStream_t stream);
 
+static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        int64_t ne10_padded, ggml_cuda_pool_alloc<char> & fallback, cudaStream_t stream);
+
 void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
@@ -2592,20 +2663,12 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // contiguously as [ne13][ne12][ne11][ne10_padded/QK8_1].
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1; // q8_1 blocks per column
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
-        ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / sizeof(float);
-        const int64_t s12 = src1->nb[2] / sizeof(float);
-        const int64_t s13 = src1->nb[3] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-    }
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const block_q8_1 * xq_all = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
 
     for (int64_t i3 = 0; i3 < ne13; i3++) {
     for (int64_t i2 = 0; i2 < ne12; i2++) {
-        const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get()
-                              + (i3 * ne12 + i2) * ne11 * x_stride;
+        const block_q8_1 * xq = xq_all + (i3 * ne12 + i2) * ne11 * x_stride;
         float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
         ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
             ne00, ne01, ne11, x_stride, stream);
@@ -2770,6 +2833,63 @@ static bool repack_rc_reserve(ggml_cuda_repack_route_cache & rc, void ** buf, si
     return true;
 }
 
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    if (node->data == nullptr) {
+        return;
+    }
+    const char * lo = (const char *) node->data;
+    const char * hi = lo + ggml_nbytes(node);
+    for (auto & e : ctx.repack_rc.xqc) {
+        if (e.gen == ctx.graph_gen && lo < e.hi && e.lo < hi) {
+            e.gen = 0;
+        }
+    }
+}
+
+// Quantize src1 (F32, dim0 dense) to q8_1 as [ne3][ne2][ne1][ne10_padded/QK8_1]
+// blocks. On the main stream the result is cached per graph: gate/up and the
+// shared expert (or q/k/v) quantize the same activation. Entries die when any
+// node writes their range (the graph loop calls ggml_cuda_repack_xq_invalidate),
+// so reused allocator memory never serves stale data.
+static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        const int64_t ne10_padded, ggml_cuda_pool_alloc<char> & fallback, cudaStream_t stream) {
+    const size_t bytes = src1->ne[3] * src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    auto quantize = [&](char * out) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, out, GGML_TYPE_Q8_0, src1->ne[0],
+            src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+            ne10_padded, src1->ne[1], src1->ne[2], src1->ne[3], stream);
+    };
+    bool capturing = false;
+    if (!repack_route_cache_usable(ctx, stream, &capturing)) {
+        char * p = fallback.alloc(bytes);
+        quantize(p);
+        return (const block_q8_1 *) p;
+    }
+    ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+    for (auto & e : rc.xqc) {
+        if (e.gen == ctx.graph_gen && e.data == src1->data &&
+                memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+            return (const block_q8_1 *) e.buf;
+        }
+    }
+    auto & e = rc.xqc[rc.xqc_next];
+    rc.xqc_next = (rc.xqc_next + 1) % ggml_cuda_repack_route_cache::N_XQ;
+    e.gen = 0;
+    if (!repack_rc_reserve(rc, (void **) &e.buf, &e.cap, bytes, capturing)) {
+        char * p = fallback.alloc(bytes);
+        quantize(p);
+        return (const block_q8_1 *) p;
+    }
+    quantize(e.buf);
+    e.gen  = ctx.graph_gen;
+    e.data = src1->data;
+    memcpy(e.ne, src1->ne, sizeof(e.ne));
+    memcpy(e.nb, src1->nb, sizeof(e.nb));
+    e.lo = (const char *) src1->data;
+    e.hi = e.lo + ggml_nbytes(src1);
+    return (const block_q8_1 *) e.buf;
+}
+
 // MUL_MAT_ID with src0 in the repack buffer type. The mm_ids_helper
 // compacts routing into expert-sorted assignment order; activations are
 // quantized once in natural column order and gathered per assignment
@@ -2923,8 +3043,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             route(p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert);
         }
         // quantize all activation columns once, natural order
-        p_xq = src1_q8_1.alloc(xq_bytes);
-        quantize_x(p_xq);
+        p_xq = (char *) repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
     }
     const block_q8_1 * xq = (const block_q8_1 *) p_xq;
 
@@ -3056,8 +3175,11 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
         !ggml_backend_buft_is_cuda_repack(wg->buffer->buft)) {
         return false;
     }
-    if (wu->type != GGML_TYPE_Q4_K || wg->type != GGML_TYPE_Q4_K ||
-        !ggml_are_same_shape(wu, wg)) {
+    if (wu->type != wg->type || !ggml_are_same_shape(wu, wg)) {
+        return false;
+    }
+    // Q8_0: dense decode only (shared expert)
+    if (wu->type != GGML_TYPE_Q4_K && !(wu->type == GGML_TYPE_Q8_0 && up->src[2] == nullptr)) {
         return false;
     }
     const ggml_glu_op op = ggml_get_glu_op(glu);
@@ -3090,13 +3212,18 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
 
     if (ids == nullptr) {
         // dense decode column
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
-            ne10_padded * sizeof(block_q8_1) / QK8_1);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            up_w->type, ne00, ne00, ne00, ne00, ne10_padded, 1, 1, 1, stream);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
+        if (up_w->type == GGML_TYPE_Q8_0) {
+            const dim3 grid((ne01 + 3) / 4, 1, 1);
+            mul_mat_vec_q8_0_repacked_glu<1><<<grid, 256, 0, stream>>>(
+                wu, wg, xq, dst_d,
+                (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            return;
+        }
         const dim3 grid((ne01 + 7) / 8, 1, 1);
         mul_mat_vec_q4k_repacked_glu<false><<<grid, 256, 0, stream>>>(
-            wu, wg, (const block_q8_1 *) src1_q8_1.get(), dst_d,
+            wu, wg, xq, dst_d,
             (uint32_t) ne00, (uint32_t) ne01, glu_op,
             nullptr, nullptr, nullptr, 0, 0, 0, 0);
         return;
@@ -3110,18 +3237,13 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(dst->nb[1] == (size_t) dst->ne[0] * sizeof(float));
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
-        src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-            up_w->type, ne00, s11, s11 * src1->ne[1], s11 * src1->ne[1],
-            ne10_padded, src1->ne[1], 1, 1, stream);
-    }
+    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
     const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
     const dim3 grid((ne01 + 7) / 8, n_assign, 1);
     mul_mat_vec_q4k_repacked_glu<true><<<grid, 256, 0, stream>>>(
-        wu, wg, (const block_q8_1 *) src1_q8_1.get(), dst_d,
+        wu, wg, xq, dst_d,
         (uint32_t) ne00, (uint32_t) ne01, glu_op,
         (const int32_t *) ids->data, nullptr, nullptr,
         (uint32_t) ne02, expert_stride, xs_eff, dst_s1);

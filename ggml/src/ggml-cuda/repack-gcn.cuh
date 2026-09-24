@@ -50,6 +50,9 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_tensor * dst);
 
 // Fused gate+up GLU decode path (Q4_K, dense and MoE).
+// drop cached q8_1 activations whose source range node writes
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+
 bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
     const ggml_tensor * glu);
 void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,

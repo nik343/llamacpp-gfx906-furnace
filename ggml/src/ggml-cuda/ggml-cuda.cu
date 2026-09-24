@@ -720,6 +720,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     repack_rc.retired.push_back(repack_rc.route_buf);
     repack_rc.retired.push_back(repack_rc.xq);
+    for (auto & e : repack_rc.xqc) {
+        repack_rc.retired.push_back(e.buf);
+    }
     for (void * p : repack_rc.retired) {
         if (p != nullptr) {
             ggml_cuda_set_device(device);
@@ -4792,9 +4795,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_repack_xq_invalidate(*cuda_ctx, node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    for (int j = 1; j <= nodes_to_skip; ++j) {
+                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j]);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
