@@ -4376,6 +4376,39 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// RMS_NORM -> SCALE and SCALE -> SILU chains (fused on some backends)
+struct test_norm_scale_chain : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool rms; // true: rms_norm -> scale, false: scale -> silu
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return rms ? "RMS_NORM_SCALE" : "SCALE_SILU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, rms);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_norm_scale_chain(std::array<int64_t, 4> ne = {128, 16, 1, 1}, bool rms = true)
+        : ne(ne), rms(rms) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * out;
+        if (rms) {
+            out = ggml_scale(ctx, ggml_rms_norm(ctx, a, 1e-6f/ne[0]), 1.0f/sqrtf((float) ne[0]));
+        } else {
+            out = ggml_silu(ctx, ggml_scale(ctx, a, 0.25f));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9073,6 +9106,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, false, true));
+    test_cases.emplace_back(new test_norm_scale_chain({128, 16, 1, 1}, true));
+    test_cases.emplace_back(new test_norm_scale_chain({128, 32, 3, 2}, true));
+    test_cases.emplace_back(new test_norm_scale_chain({4096, 5, 1, 1}, true));
+    test_cases.emplace_back(new test_norm_scale_chain({320, 1, 1, 1}, false));
+    test_cases.emplace_back(new test_norm_scale_chain({1000, 7, 3, 1}, false));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

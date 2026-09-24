@@ -154,6 +154,41 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// RMS_NORM -> SCALE (the GDN l2 norm): same rounding as the two ops
+template <int block_size>
+static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float s, const float b) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = s * (scale * x[col]) + b;
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -695,4 +730,36 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_node) {
+    const ggml_tensor * src0 = dst->src[0];
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_node->type == GGML_TYPE_F32 && ggml_is_contiguous(scale_node));
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+    float s, b;
+    memcpy(&s, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale_node->op_params + 1, sizeof(float));
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    const dim3 blocks_num(ne01, ne02, ne03);
+    const float * x = (const float *) src0->data;
+    float * y = (float *) scale_node->data;
+    if (ne00 < 1024) {
+        rms_norm_scale_f32<256><<<blocks_num, 256, 32 * sizeof(float), stream>>>(x, y, ne00, s01, s02, s03, eps, s, b);
+    } else {
+        rms_norm_scale_f32<1024><<<blocks_num, 1024, 32 * sizeof(float), stream>>>(x, y, ne00, s01, s02, s03, eps, s, b);
+    }
 }

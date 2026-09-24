@@ -1,4 +1,5 @@
 #include "scale.cuh"
+#include "unary.cuh"
 
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
@@ -34,4 +35,33 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
 
     scale_f32_cuda(src0_d, dst_d, scale, bias, ggml_nelements(src0), stream);
+}
+
+// SCALE -> SILU (qwen4exp hc mix): one pass, same rounding as the two ops
+static __global__ void scale_silu_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
+    ggml_cuda_pdl_lc();
+    int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i = tid; i < nelements; i += stride) {
+        dst[i] = ggml_cuda_op_silu_single(scale * x[i] + bias);
+    }
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
+    const ggml_tensor * src0 = scale_node->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && silu_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(silu_node));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(silu_node));
+
+    float scale;
+    float bias;
+    memcpy(&scale, (float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (float *) scale_node->op_params + 1, sizeof(float));
+
+    const int64_t nelements = ggml_nelements(src0);
+    const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+    scale_silu_f32<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) src0->data, (float *) silu_node->data, scale, bias, nelements);
 }

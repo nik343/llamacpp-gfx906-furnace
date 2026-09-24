@@ -3813,6 +3813,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // SCALE -> SILU (qwen4exp hc mix)
+    if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
+            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
+            ggml_is_contiguous(cgraph->nodes[i + 1])) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    // RMS_NORM -> SCALE (GDN l2 norm)
+    if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
+            ggml_is_contiguous(cgraph->nodes[i + 1])) {
+        ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (qwen4exp hc combine weights): computed inside hc_post
     if (node->op == GGML_OP_SCALE && i + 3 < cgraph->n_nodes &&
             ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE })) {
