@@ -1427,6 +1427,38 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 #if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP)
+// F32 matvec with few long rows (<= 16 rows, one token): one 1024-thread workgroup per row. The generic
+// vector kernel walks each row with one small workgroup (qwen4exp hc_inject [10240 -> 4]: ~21 us per call).
+static __global__ void __launch_bounds__(1024) gcn_f32_matvec_fewrows(
+        const float * __restrict__ A, const float * __restrict__ x, float * __restrict__ y,
+        const int K, const int64_t lda) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const float4 * a4 = reinterpret_cast<const float4 *>(A + blockIdx.x * lda);
+    const float4 * x4 = reinterpret_cast<const float4 *>(x);
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < K / 4; i += 1024) {
+        const float4 a = a4[i];
+        const float4 b = x4[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = warp_reduce_sum<warp_size>(acc);
+    __shared__ float part[1024 / warp_size];
+    if (threadIdx.x % warp_size == 0) {
+        part[threadIdx.x / warp_size] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 1024 / warp_size; w++) {
+            sum += part[w];
+        }
+        y[blockIdx.x] = sum;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 // F32 GEMMs launched on GCN (gfx906), where rocBLAS on ROCm 7.1 ships no gfx906 Tensile for
 // some shapes and the MMA-based mmf path needs matrix cores gfx906 lacks.
 // Contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
@@ -2103,6 +2135,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+#if defined(GGML_USE_HIP)
+    if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 == 1 && ne01 <= 16 && ne00 >= 2048 &&
+            ne00 % 4 == 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb00 == sizeof(float) && nb10 == sizeof(float) && nb01 % 16 == 0 && nb0 == sizeof(float) &&
+            (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0) {
+        gcn_f32_matvec_fewrows<<<ne01, 1024, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) ne00, nb01 / sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
