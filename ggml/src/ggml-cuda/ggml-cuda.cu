@@ -1556,6 +1556,32 @@ static __global__ void __launch_bounds__(1024) gcn_f32_matvec_fewrows(
         y[blockIdx.x] = sum;
     }
 }
+
+// one wave per row (MoE router 2560x512, GDN beta/alpha 2560x48): each lane keeps
+// K/256 float4 loads in flight instead of mmvf's 128-thread row loop
+static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows(
+        const float * __restrict__ A, const float * __restrict__ x, float * __restrict__ y,
+        const int K, const int64_t lda, const int M) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x * (256 / warp_size) + threadIdx.x / warp_size;
+    const int lane = threadIdx.x % warp_size;
+    if (row >= M) {
+        return;
+    }
+    const float4 * a4 = reinterpret_cast<const float4 *>(A + row * lda);
+    const float4 * x4 = reinterpret_cast<const float4 *>(x);
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int i = lane; i < K / 4; i += warp_size) {
+        const float4 a = a4[i];
+        const float4 b = x4[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = warp_reduce_sum<warp_size>(acc);
+    if (lane == 0) {
+        y[row] = acc;
+    }
+}
 #endif // defined(GGML_USE_HIP)
 
 // F32 GEMMs launched on GCN (gfx906), where rocBLAS on ROCm 7.1 ships no gfx906 Tensile for
@@ -2246,6 +2272,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0) {
         gcn_f32_matvec_fewrows<<<ne01, 1024, 0, ctx.stream()>>>(
             (const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) ne00, nb01 / sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 == 1 && ne01 > 16 && ne01 <= 16384 &&
+            ne00 >= 1024 && ne00 % 4 == 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb00 == sizeof(float) && nb10 == sizeof(float) && nb01 % 16 == 0 && nb0 == sizeof(float) &&
+            (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0 &&
+            getenv("GGML_CUDA_NO_F32_ROWS") == nullptr) {
+        const int rows_per_block = 256 / warp_size;
+        gcn_f32_matvec_rows<<<(ne01 + rows_per_block - 1) / rows_per_block, 256, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) ne00, nb01 / sizeof(float), (int) ne01);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -10066,6 +10066,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 1,  2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  1, 1,  6148, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  3, 1,  4098, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  48, 1,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  17, 1,  1028, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 333, 1,  4100, {1, 1}, {1, 1}));
     // skinny-M F32 GEMM shapes (qwen4exp hc inject, shexp gate, ssm alpha/beta) and odd sizes
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  4, 512, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  1, 512,  2560, {1, 1}, {1, 1}));
@@ -11229,6 +11233,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp decode hc inject F32 matvec (10240 -> 4)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 1, 10240, {1, 1}, {1, 1}));
+
+    // qwen4exp decode router and GDN beta/alpha F32 matvecs
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, 1, 2560, {1, 1}, {1, 1}));
 
     // qwen4exp decode router top-k (512 experts, 10 used, softmax + norm)
     test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
