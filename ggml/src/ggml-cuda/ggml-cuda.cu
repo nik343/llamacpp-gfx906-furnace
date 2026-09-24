@@ -805,10 +805,101 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Synchronous host<->device copies through a per-device pinned bounce buffer.
+// HIP pins pageable host memory on the fly for large copies and caches the
+// pinning by address; when glibc unmaps a large block and a new one lands at
+// the same address (checkpoint blobs, prompt cache), the DMA engine can read
+// through a stale mapping and fault (seen on gfx906 / ROCm 7.1 as an XDMA
+// no-retry page fault during checkpoint restore). The runtime then only ever
+// sees memory this backend pinned once. GGML_CUDA_NO_BOUNCE=1 disables it.
+#if defined(GGML_USE_HIP)
+struct ggml_cuda_bounce_buffer {
+    static constexpr size_t CHUNK = 8u << 20;
+    std::mutex   mtx;
+    char       * host = nullptr; // 2 x CHUNK
+    cudaEvent_t  ev[2] = { nullptr, nullptr };
+};
+
+static ggml_cuda_bounce_buffer * ggml_cuda_get_bounce(int device) {
+    static const bool disabled = getenv("GGML_CUDA_NO_BOUNCE") != nullptr;
+    if (disabled) {
+        return nullptr;
+    }
+    static ggml_cuda_bounce_buffer bufs[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_bounce_buffer & b = bufs[device];
+    if (b.host == nullptr) {
+        std::lock_guard<std::mutex> lock(b.mtx);
+        if (b.host == nullptr) {
+            void * p = nullptr;
+            if (cudaHostAlloc(&p, 2 * ggml_cuda_bounce_buffer::CHUNK, cudaHostAllocPortable) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return nullptr;
+            }
+            for (auto & e : b.ev) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            }
+            b.host = (char *) p;
+        }
+    }
+    return &b;
+}
+
+static bool ggml_cuda_bounce_h2d(int device, void * dst, const void * src, size_t size) {
+    ggml_cuda_bounce_buffer * b = ggml_cuda_get_bounce(device);
+    if (b == nullptr) {
+        return false;
+    }
+    constexpr size_t C = ggml_cuda_bounce_buffer::CHUNK;
+    std::lock_guard<std::mutex> lock(b->mtx);
+    for (size_t off = 0, k = 0; off < size; off += C, ++k) {
+        const size_t n = std::min(C, size - off);
+        char * h = b->host + (k & 1) * C;
+        if (k >= 2) {
+            CUDA_CHECK(cudaEventSynchronize(b->ev[k & 1])); // DMA out of this half is done
+        }
+        memcpy(h, (const char *) src + off, n);
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst + off, h, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaEventRecord(b->ev[k & 1], cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    return true;
+}
+
+static bool ggml_cuda_bounce_d2h(int device, void * dst, const void * src, size_t size) {
+    ggml_cuda_bounce_buffer * b = ggml_cuda_get_bounce(device);
+    if (b == nullptr) {
+        return false;
+    }
+    constexpr size_t C = ggml_cuda_bounce_buffer::CHUNK;
+    std::lock_guard<std::mutex> lock(b->mtx);
+    const size_t n_chunks = (size + C - 1) / C;
+    // DMA chunk k while copying chunk k-1 out of the other half
+    for (size_t k = 0; k <= n_chunks; ++k) {
+        if (k < n_chunks) {
+            const size_t off = k * C;
+            CUDA_CHECK(cudaMemcpyAsync(b->host + (k & 1) * C, (const char *) src + off, std::min(C, size - off),
+                cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaEventRecord(b->ev[k & 1], cudaStreamPerThread));
+        }
+        if (k > 0) {
+            const size_t j = k - 1, off = j * C;
+            CUDA_CHECK(cudaEventSynchronize(b->ev[j & 1]));
+            memcpy((char *) dst + off, b->host + (j & 1) * C, std::min(C, size - off));
+        }
+    }
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_bounce_h2d(ctx->device, (char *) tensor->data + offset, data, size)) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -817,6 +908,11 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_bounce_d2h(ctx->device, data, (const char *) tensor->data + offset, size)) {
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
