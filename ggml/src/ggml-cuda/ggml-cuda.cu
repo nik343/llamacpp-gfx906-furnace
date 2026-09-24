@@ -3903,6 +3903,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3928,7 +3930,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (types && a != node && b != mul && g->ne[0] == 1 && ggml_is_contiguous(g) &&
                     ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
                     ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
-                    ggml_is_contiguous(add)) {
+                    ggml_is_contiguous(add) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, std::array<int, 1>{ i + 2 }.data(), 1)) {
                 ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, g, a, b, add);
                 return 2;
             }
@@ -3938,14 +3940,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // SCALE -> SILU (qwen4exp hc mix)
     if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
-            ggml_is_contiguous(cgraph->nodes[i + 1])) {
+            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, std::array<int, 1>{ i + 1 }.data(), 1)) {
         ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
     // RMS_NORM -> SCALE (GDN l2 norm)
     if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
-            ggml_is_contiguous(cgraph->nodes[i + 1])) {
+            ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, std::array<int, 1>{ i + 1 }.data(), 1)) {
         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -3963,7 +3965,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         memcpy(&b_out, (const float *) sc2->op_params + 1, sizeof(float));
         if (ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && b_in == 0.0f && b_out == 0.0f &&
                 post->op == GGML_OP_DSV4_HC_POST && post->src[2] == sc2 && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
-                node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_stride(node->src[0], sc2)) {
+                node->src[0]->type == GGML_TYPE_F32 && ggml_are_same_stride(node->src[0], sc2) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, std::array<int, 1>{ i + 3 }.data(), 1)) {
             ggml_cuda_op_dsv4_hc_post_act(*cuda_ctx, post, node->src[0], s_in, s_out);
             return 3;
         }
@@ -4764,6 +4767,18 @@ namespace gfxprof {
             const size_t dash = nm.rfind('-');
             if (dash != std::string::npos && nm.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
                 nm.resize(dash);
+            }
+            if ((node->op == GGML_OP_CONT || node->op == GGML_OP_CPY) && node->src[0]) {
+                // what is being copied: the root tensor behind the view chain
+                const ggml_tensor * r = node->src[0];
+                while (r->view_src) {
+                    r = r->view_src;
+                }
+                nm += " <- ";
+                nm += r->name;
+                nm += " (";
+                nm += ggml_op_desc(r);
+                nm += ")";
             }
             return std::string(buf) + " [" + nm + "]";
         }
