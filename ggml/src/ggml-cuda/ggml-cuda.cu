@@ -3579,7 +3579,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    // n_tokens == 0 still matches (empty nodes are never executed): graph_optimize adds the
+    // alloc dependency either way, so a zero-row last layer (no-output ubatch) keeps the graph
+    // topology of the output ubatch and does not force a pipeline-draining realloc
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens < 0) {
         return false;
     }
 
@@ -6208,10 +6211,16 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
+    // events need no peer access; without them the scheduler synchronizes a whole
+    // device before every split input copy, so layer-split ubatches never overlap.
+    // NO_PEER_COPY builds keep the old behaviour with GGML_CUDA_NO_EVENTS=1.
 #ifdef GGML_CUDA_NO_PEER_COPY
-    GGML_UNUSED(dev);
-    return nullptr;
-#else
+    static const bool no_events = getenv("GGML_CUDA_NO_EVENTS") != nullptr;
+    if (no_events) {
+        return nullptr;
+    }
+#endif
+    {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
 
     ggml_cuda_set_device(dev_ctx->device);
@@ -6223,7 +6232,7 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
         /* .device  = */ dev,
         /* .context = */ event,
     };
-#endif
+    }
 }
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
