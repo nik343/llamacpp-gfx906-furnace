@@ -345,6 +345,92 @@ static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buf
     return ok;
 }
 
+// One MoE layer: gate, up (Q4_K, shared src1) and down (Q5_1) with shared ids,
+// once as a single 3-node graph and once as 3 separate graphs. The backend
+// caches routing and quantized activations within one graph; outputs must
+// be bitwise identical.
+static bool run_moe_layer(const params & p, ggml_backend_t backend, ggml_backend_buffer_type_t repack_buft,
+        const std::string & routing) {
+    const int64_t T = p.tokens, K = 2560, N = 640;
+    const int n_expert = 512, n_used = 10;
+    float sigma = routing == "bench" ? 3.3f : 1.5f, dead = routing == "bench" ? 0.0f : 0.17f;
+    if (p.sigma >= 0.0f) { sigma = p.sigma; }
+    if (p.dead  >= 0.0f) { dead  = p.dead;  }
+    std::vector<int32_t> ids_host = make_ids(n_expert, n_used, (int) T, sigma, dead, p.seed);
+    print_routing(ids_host, n_expert);
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead() * 8, nullptr, true };
+    ggml_context * ctx_w = ggml_init(ip);
+    ggml_context * ctx_a = ggml_init(ip);
+    ggml_tensor * wg  = ggml_new_tensor_3d(ctx_w, GGML_TYPE_Q4_K, K, N, n_expert);
+    ggml_tensor * wu  = ggml_new_tensor_3d(ctx_w, GGML_TYPE_Q4_K, K, N, n_expert);
+    ggml_tensor * wd  = ggml_new_tensor_3d(ctx_w, GGML_TYPE_Q5_1, N, K, n_expert);
+    ggml_tensor * x   = ggml_new_tensor_3d(ctx_a, GGML_TYPE_F32, K, 1, T);
+    ggml_tensor * xd  = ggml_new_tensor_3d(ctx_a, GGML_TYPE_F32, N, n_used, T);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx_a, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * og  = ggml_mul_mat_id(ctx_a, wg, x,  ids);
+    ggml_tensor * ou  = ggml_mul_mat_id(ctx_a, wu, x,  ids);
+    ggml_tensor * od  = ggml_mul_mat_id(ctx_a, wd, xd, ids);
+
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, repack_buft);
+    GGML_ASSERT(buf_w);
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_t buf_a = ggml_backend_alloc_ctx_tensors(ctx_a, backend);
+    GGML_ASSERT(buf_a);
+    {
+        std::vector<uint8_t> q = make_weight(GGML_TYPE_Q4_K, K, N * n_expert, p.seed + 17);
+        ggml_backend_tensor_set(wg, q.data(), 0, q.size());
+        q = make_weight(GGML_TYPE_Q4_K, K, N * n_expert, p.seed + 18);
+        ggml_backend_tensor_set(wu, q.data(), 0, q.size());
+        q = make_weight(GGML_TYPE_Q5_1, N, K * n_expert, p.seed + 19);
+        ggml_backend_tensor_set(wd, q.data(), 0, q.size());
+        std::vector<float> xf(ggml_nelements(x));
+        fill_normal(xf.data(), xf.size(), 1.0f, p.seed + 29);
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+        xf.resize(ggml_nelements(xd));
+        fill_normal(xf.data(), xf.size(), 1.0f, p.seed + 31);
+        ggml_backend_tensor_set(xd, xf.data(), 0, ggml_nbytes(xd));
+        ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+    }
+    auto get_all = [&]() {
+        std::vector<float> y(ggml_nelements(og) + ggml_nelements(ou) + ggml_nelements(od));
+        ggml_backend_tensor_get(og, y.data(), 0, ggml_nbytes(og));
+        ggml_backend_tensor_get(ou, y.data() + ggml_nelements(og), 0, ggml_nbytes(ou));
+        ggml_backend_tensor_get(od, y.data() + ggml_nelements(og) + ggml_nelements(ou), 0, ggml_nbytes(od));
+        return y;
+    };
+
+    ggml_cgraph * g1[3];
+    ggml_tensor * outs[3] = { og, ou, od };
+    for (int i = 0; i < 3; i++) {
+        g1[i] = ggml_new_graph_custom(ctx_a, 4, false);
+        ggml_build_forward_expand(g1[i], outs[i]);
+    }
+    ggml_cgraph * g3 = ggml_new_graph_custom(ctx_a, 8, false);
+    for (int i = 0; i < 3; i++) {
+        ggml_build_forward_expand(g3, outs[i]);
+    }
+
+    double us_sep = 0.0;
+    for (int i = 0; i < 3; i++) {
+        us_sep += time_graph(backend, g1[i], p.warmup, p.reps);
+    }
+    const std::vector<float> y_sep = get_all();
+    const double us_one = time_graph(backend, g3, p.warmup, p.reps);
+    const std::vector<float> y_one = get_all();
+    const bool same = memcmp(y_sep.data(), y_one.data(), y_sep.size() * sizeof(float)) == 0;
+    printf("%-36s 3 graphs %10.1f us | 1 graph %10.1f us | %+.1f%% | %s\n",
+        ("moe_layer [" + routing + "]").c_str(), us_sep, us_one, 100.0 * (us_one / us_sep - 1.0),
+        same ? "bitwise identical" : "MISMATCH");
+    fflush(stdout);
+
+    ggml_backend_buffer_free(buf_a);
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx_a);
+    ggml_free(ctx_w);
+    return same;
+}
+
 int main(int argc, char ** argv) {
     params p;
     for (int i = 1; i < argc; i++) {
@@ -446,6 +532,18 @@ int main(int argc, char ** argv) {
             continue;
         }
         all_ok &= run_shape(p, backend, repack_buft, s, fdump);
+    }
+
+    // opt-in only (--filter moe_layer), so the default dump layout is unchanged
+    if (p.filter.find("moe_layer") != std::string::npos) {
+        const char * v = getenv("GGML_CUDA_REPACK_Q5_1");
+        if (!v || v[0] == '0') {
+            printf("moe_layer skipped (GGML_CUDA_REPACK_Q5_1 not set)\n");
+        } else {
+            for (const auto & r : moe_routings(true)) {
+                all_ok &= run_moe_layer(p, backend, repack_buft, r);
+            }
+        }
     }
 
     if (fdump) {

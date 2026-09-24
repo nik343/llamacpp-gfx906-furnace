@@ -706,6 +706,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    repack_rc.retired.push_back(repack_rc.route_buf);
+    repack_rc.retired.push_back(repack_rc.xq);
+    for (void * p : repack_rc.retired) {
+        if (p != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(p));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4755,6 +4763,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->graph_gen++; // invalidates the repack routing cache
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

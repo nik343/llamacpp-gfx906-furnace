@@ -2512,6 +2512,45 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     GGML_UNUSED(ctx);
 }
 
+// Routing cache use: bypassed on side streams and with
+// GGML_CUDA_REPACK_NO_ROUTE_CACHE set. Under graph capture the hit/miss
+// sequence is baked into the graph, which is fine: each replay reruns the
+// misses in the same stream order, and cache buffers are never freed while
+// the context lives. Growing (cudaMalloc) is not done while capturing;
+// *capturing tells the caller to fall back to pool buffers instead.
+static bool repack_route_cache_usable(ggml_backend_cuda_context & ctx, cudaStream_t stream, bool * capturing) {
+    static const bool disabled = getenv("GGML_CUDA_REPACK_NO_ROUTE_CACHE") != nullptr;
+    if (disabled || ctx.curr_stream_no != 0) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    hipStreamCaptureStatus st;
+    CUDA_CHECK(hipStreamIsCapturing(stream, &st));
+    *capturing = st != hipStreamCaptureStatusNone;
+#else
+    cudaStreamCaptureStatus st;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &st));
+    *capturing = st != cudaStreamCaptureStatusNone;
+#endif
+    return true;
+}
+
+// grow-only cache buffer; false if it would have to grow during capture
+static bool repack_rc_reserve(ggml_cuda_repack_route_cache & rc, void ** buf, size_t * cap, size_t need, bool capturing) {
+    if (need <= *cap) {
+        return true;
+    }
+    if (capturing) {
+        return false;
+    }
+    if (*buf != nullptr) {
+        rc.retired.push_back(*buf);
+    }
+    CUDA_CHECK(cudaMalloc(buf, need));
+    *cap = need;
+    return true;
+}
+
 // MUL_MAT_ID with src0 in the repack buffer type. The mm_ids_helper
 // compacts routing into expert-sorted assignment order; activations are
 // quantized once in natural column order and gathered per assignment
@@ -2545,32 +2584,130 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const size_t expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
-    // routing compaction
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-    if (n_tokens > 1) {
-        const int si1  = ids->nb[1] / sizeof(int32_t);
-        const int sis1 = src1->nb[2] / src1->nb[1];
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data,
-            ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // quantize all activation columns once, natural order
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const int64_t x_stride    = ne10_padded / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
-        src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1);
-    {
+    const size_t  xq_bytes    = src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const int     si1         = ids->nb[1] / sizeof(int32_t);
+    const int     sis1        = src1->nb[2] / src1->nb[1];
+
+    // batch: grouped tile GEMM, thin 16-token tiles (MoE routing spreads
+    // tokens across experts; a 64-wide tile would be mostly empty)
+    constexpr int TN_ID = 1;
+    // over-launch upper bound: every expert can add one partial tile
+    const int64_t max_tiles = n_assign / (16 * TN_ID) + ne02;
+    GGML_ASSERT(ne02 <= 4096);
+
+    int32_t * p_ids_src1    = nullptr;
+    int32_t * p_ids_dst     = nullptr;
+    int32_t * p_bounds      = nullptr;
+    int32_t * p_tile_off    = nullptr;
+    int32_t * p_tile_expert = nullptr;
+    char    * p_xq          = nullptr;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> tile_expert(ctx.pool());
+    ggml_cuda_pool_alloc<char>    src1_q8_1(ctx.pool());
+
+    auto quantize_x = [&](char * xq_out) {
         const int64_t s11 = src1->nb[1] / sizeof(float);
         const int64_t s12 = src1->nb[2] / sizeof(float);
-        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, xq_out,
             src0->type, ne10, s11, s12, s12 * src1->ne[2], ne10_padded,
             src1->ne[1], src1->ne[2], 1, stream);
+    };
+    auto route = [&](int32_t * s1, int32_t * d, int32_t * b, int32_t * to, int32_t * te) {
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, s1, d, b,
+            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
+        CUDA_CHECK(cudaGetLastError());
+        repack_tile_map<16 * TN_ID><<<1, 1024, 0, stream>>>(b, to, te, ne02);
+    };
+
+    bool capturing = false;
+    const bool use_rc = n_tokens > 1 && repack_route_cache_usable(ctx, stream, &capturing);
+    ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+
+    if (n_tokens > 1 && use_rc) {
+        // gate/up/down of one layer share ids: reuse the routing
+        const bool route_hit = rc.gen == ctx.graph_gen && rc.ids == ids && rc.ids_data == ids->data &&
+            rc.n_tokens == n_tokens && rc.n_used == n_expert_used && rc.ne02 == ne02 && rc.si1 == si1;
+        // ids_src1[a] = it*sis1 + slot % ne11 (contiguous src1: sis1 == ne11),
+        // ids_dst[a] = it*n_used + slot, so ne11 == n_used reuses ids_dst
+        const bool src1_is_dst = src1->ne[1] == n_expert_used && sis1 == n_expert_used;
+        if (route_hit && (rc.ne11 == src1->ne[1] || src1_is_dst)) {
+            p_ids_src1    = rc.ne11 == src1->ne[1] ? rc.ids_src1 : rc.ids_dst;
+            p_ids_dst     = rc.ids_dst;
+            p_bounds      = rc.bounds;
+            p_tile_off    = rc.tile_off;
+            p_tile_expert = rc.tile_expert;
+        } else {
+            rc.gen = 0; // invalid until rewritten below
+            const size_t need = (2 * n_assign + 2 * (ne02 + 1) + max_tiles) * sizeof(int32_t);
+            if (repack_rc_reserve(rc, &rc.route_buf, &rc.cap, need, capturing)) {
+                rc.ids_src1    = (int32_t *) rc.route_buf;
+                rc.ids_dst     = rc.ids_src1 + n_assign;
+                rc.bounds      = rc.ids_dst + n_assign;
+                rc.tile_off    = rc.bounds + ne02 + 1;
+                rc.tile_expert = rc.tile_off + ne02 + 1;
+                rc.gen      = ctx.graph_gen;
+                rc.ids      = ids;
+                rc.ids_data = ids->data;
+                rc.n_tokens = n_tokens;
+                rc.n_used   = n_expert_used;
+                rc.ne02     = ne02;
+                rc.si1      = si1;
+                rc.ne11     = src1->ne[1];
+                p_ids_src1    = rc.ids_src1;
+                p_ids_dst     = rc.ids_dst;
+                p_bounds      = rc.bounds;
+                p_tile_off    = rc.tile_off;
+                p_tile_expert = rc.tile_expert;
+            } else {
+                p_ids_src1    = ids_src1.alloc(n_assign);
+                p_ids_dst     = ids_dst.alloc(n_assign);
+                p_bounds      = expert_bounds.alloc(ne02 + 1);
+                p_tile_off    = tile_off.alloc(ne02 + 1);
+                p_tile_expert = tile_expert.alloc(max_tiles);
+            }
+            route(p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert);
+        }
+
+        // gate/up share src1: reuse the quantized activations
+        const bool x_hit = rc.x_gen == ctx.graph_gen && rc.x == src1 && rc.x_data == src1->data &&
+            rc.x_ne0 == src1->ne[0] && rc.x_ne1 == src1->ne[1] && rc.x_ne2 == src1->ne[2];
+        if (x_hit) {
+            p_xq = rc.xq;
+        } else {
+            rc.x_gen = 0;
+            if (repack_rc_reserve(rc, (void **) &rc.xq, &rc.xq_cap, xq_bytes, capturing)) {
+                p_xq      = rc.xq;
+                rc.x_gen  = ctx.graph_gen;
+                rc.x      = src1;
+                rc.x_data = src1->data;
+                rc.x_ne0  = src1->ne[0];
+                rc.x_ne1  = src1->ne[1];
+                rc.x_ne2  = src1->ne[2];
+            } else {
+                p_xq = src1_q8_1.alloc(xq_bytes);
+            }
+            quantize_x(p_xq);
+        }
+    } else {
+        if (n_tokens > 1) {
+            p_ids_src1    = ids_src1.alloc(n_assign);
+            p_ids_dst     = ids_dst.alloc(n_assign);
+            p_bounds      = expert_bounds.alloc(ne02 + 1);
+            p_tile_off    = tile_off.alloc(ne02 + 1);
+            p_tile_expert = tile_expert.alloc(max_tiles);
+            route(p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert);
+        }
+        // quantize all activation columns once, natural order
+        p_xq = src1_q8_1.alloc(xq_bytes);
+        quantize_x(p_xq);
     }
-    const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
+    const block_q8_1 * xq = (const block_q8_1 *) p_xq;
 
     if (n_tokens == 1) {
         // decode: one matvec per slot; experts read directly from the
@@ -2634,53 +2771,44 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         return;
     }
 
-    // batch: grouped tile GEMM, thin 16-token tiles (MoE routing spreads
-    // tokens across experts; a 64-wide tile would be mostly empty)
-    constexpr int TN_ID = 1;
-    // over-launch upper bound: every expert can add one partial tile
-    const int64_t max_tiles = n_assign / (16 * TN_ID) + ne02;
-    GGML_ASSERT(ne02 <= 4096);
-    ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool(), ne02 + 1);
-    ggml_cuda_pool_alloc<int32_t> tile_expert(ctx.pool(), max_tiles);
-    repack_tile_map<16 * TN_ID><<<1, 1024, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_expert.get(), ne02);
     const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM, max_tiles, 1);
 
     switch (src0->type) {
         case GGML_TYPE_Q3_K:
             mmq_gemm_q3k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q4_K:
             static_assert(TN_ID == 1, "w1 kernel tiles 16 assignments");
             mmq_gemm_q4k_repacked_id_w1<2><<<dim3((ne01 + 63) / 64, max_tiles, 1), 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q5_K:
             mmq_gemm_q5k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q6_K:
             mmq_gemm_q6k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q5_1:
             mmq_gemm_q5_1_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         case GGML_TYPE_Q8_0:
             mmq_gemm_q8_0_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
-                ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_expert.get(),
+                p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert,
                 (uint32_t) ne02, expert_stride, dst_s1);
             break;
         default: GGML_ABORT("unsupported repack type");
