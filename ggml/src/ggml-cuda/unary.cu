@@ -1,4 +1,5 @@
 #include "unary.cuh"
+#include "repack-gcn.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -274,6 +275,32 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 
     ggml_cuda_pdl_sync();
     dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+}
+
+// float unary*mul that also writes the result as q8_1 blocks for a repacked matvec consumer
+// (arithmetic of quantize_q8_1; k % 32 == 0 so whole 32-lane groups exit together)
+template <float (*op)(float)>
+static __global__ void unary_gated_q8_kernel(const float * x, const float * g, float * dst, const int64_t k, const int64_t n,
+        const int64_t o0, const int64_t o1, block_q8_1 * yq) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+    const float v = op(x[j0]) * g[j1];
+    dst[i] = v;
+
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    yq[i / QK8_1].qs[i % QK8_1] = q;
+    if (i % QK8_1 == 0) {
+        yq[i / QK8_1].ds = make_half2(d, sum);
+    }
 }
 
 template <float (*op)(float), typename T>
@@ -680,6 +707,15 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (half *) mul_node->data, k, nc,
                              unary_stride / sizeof(half), other_stride / sizeof(half), stream);
     } else {
+        void * yq = (k % QK8_1 == 0 && ggml_is_contiguous(mul_node)) ?
+            ggml_cuda_repack_xq_emit_target(ctx, ctx.cur_cgraph, mul_node) : nullptr;
+        if (yq != nullptr) {
+            const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+            unary_gated_q8_kernel<op><<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+                (const float *) unary_src->data, (const float *) other_src->data, (float *) mul_node->data, k, nc,
+                unary_stride / sizeof(float), other_stride / sizeof(float), (block_q8_1 *) yq);
+            return;
+        }
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                              (float *) mul_node->data, k, nc,
                              unary_stride / sizeof(float), other_stride / sizeof(float), stream);
