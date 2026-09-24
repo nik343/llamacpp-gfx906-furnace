@@ -1237,8 +1237,8 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 // 35B-A3B). Used for both dense MUL_MAT (ids == nullptr) and
 // MUL_MAT_ID decode. ID path uses half-sub-block units (small-K expert
 // tensors; min term on the even half).
-template <bool HAS_IDS>
-static __global__ void mul_mat_vec_q4k_repacked_glu(
+template <bool HAS_IDS, int ROWS = 2, int MIN_BLOCKS = 1>
+static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repacked_glu(
         const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
         const block_q8_1 * __restrict__ xq, float * __restrict__ y,
         const uint32_t ne0, const uint32_t ne1, const int glu_op,
@@ -1257,7 +1257,7 @@ static __global__ void mul_mat_vec_q4k_repacked_glu(
     } else {
         GGML_UNUSED_VARS(ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
     }
-    constexpr int ROWS = 2;
+    // ROWS: template parameter
     const int wave = threadIdx.x >> 6;
     const int lane = threadIdx.x & 63;
     const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
@@ -2728,11 +2728,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     mul_mat_vec_q8_0_repacked_splitk<<<ne01, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
                     break;
                 }
-                // large ne01: single-wave ROWS=1 blocks maximize the
+                // ne01 >= 512: single-wave ROWS=1 blocks maximize the
                 // wavefront count (measured on gfx906: ROWS=2 at
-                // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it). Small
-                // ne01: 4-wave ROWS=2 blocks (the K-quant matvec shape).
-                if (ne01 >= 4096) {
+                // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it; at 512-2560
+                // rows ROWS=1 is also faster in qwen4exp decode, tg +1.5%).
+                // Small ne01: 4-wave ROWS=2 blocks (the K-quant matvec shape).
+                if (ne01 >= 512) {
                     const dim3 grid(ne01, 1, 1);
                     mul_mat_vec_q8_0_repacked<1, 1, false><<<grid, 64, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
@@ -3241,12 +3242,12 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
     const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
-    const dim3 grid((ne01 + 7) / 8, n_assign, 1);
-    mul_mat_vec_q4k_repacked_glu<true><<<grid, 256, 0, stream>>>(
-        wu, wg, xq, dst_d,
-        (uint32_t) ne00, (uint32_t) ne01, glu_op,
-        (const int32_t *) ids->data, nullptr, nullptr,
-        (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+    // one row per wave: the 2-row kernel needs 51 VGPRs (4 waves/SIMD) and is
+    // latency-bound at ~380 GB/s; ROWS=1 runs 41 vs 49 us per call in decode
+    const dim3 grid((ne01 + 3) / 4, n_assign, 1);
+    mul_mat_vec_q4k_repacked_glu<true, 1><<<grid, 256, 0, stream>>>(
+        wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op,
+        (const int32_t *) ids->data, nullptr, nullptr, (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
 }
 
 // ---------------------------------------------------------------------
