@@ -1181,6 +1181,59 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_flat(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Dense Q8_0 decode with a compile-time trip count: LANES lanes per row (64/LANES rows per
+// wave), each lane owns ITERS half-sub-block units (n_blocks*2 == ITERS*LANES) and issues all of
+// their weight/scale/activation loads before the dot products. The runtime-bounded loop of
+// mul_mat_vec_q8_0_repacked keeps only one unit in flight and mid-size tensors (17-33 MB)
+// stream at 565-670 GB/s against ~840 for the 675 MB output head.
+template <int ITERS, int LANES>
+static __global__ void __launch_bounds__(64) mul_mat_vec_q8_0_repacked_rowu(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const int lane = threadIdx.x % LANES;
+    const uint32_t row = blockIdx.x * (64 / LANES) + threadIdx.x / LANES;
+    const bool valid = row < ne1;
+    const uint32_t rr = valid ? row : 0;
+
+    int4     w[ITERS];
+    int4     xv[ITERS];
+    uint16_t db[ITERS];
+    float    dx[ITERS];
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        const uint32_t hb = lane + j * LANES;
+        const uint32_t sb = hb >> 1, half = hb & 1;
+        w[j]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) rr * nsp + sb) * 8 + half * 4);
+        db[j] = d_plane[(size_t) rr * nsp + sb];
+        const block_q8_1 * xb = xq + sb;
+        xv[j] = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+        dx[j] = __low2float(xb->ds);
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        int idot = 0;
+        idot = ggml_cuda_dp4a(w[j].x, xv[j].x, idot);
+        idot = ggml_cuda_dp4a(w[j].y, xv[j].y, idot);
+        idot = ggml_cuda_dp4a(w[j].z, xv[j].z, idot);
+        idot = ggml_cuda_dp4a(w[j].w, xv[j].w, idot);
+        acc += __half2float(*reinterpret_cast<const __half *>(&db[j])) * dx[j] * (float) idot;
+    }
+    acc = warp_reduce_sum<LANES>(acc);
+    if (lane == 0 && valid) {
+        y[row] = acc;
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 template <bool HAS_IDS>
 static void launch_mul_mat_vec_q8_0_repacked_seg(
         const uint8_t * w, const block_q8_1 * xq, float * y, const int64_t ne00, const int64_t ne01,
@@ -2790,6 +2843,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 // ne01=4096 stalls ~184 GB/s, ROWS=1 ~2x it; at 512-2560
                 // rows ROWS=1 is also faster in qwen4exp decode, tg +1.5%).
                 // Small ne01: 4-wave ROWS=2 blocks (the K-quant matvec shape).
+                if (ne01 >= 512 && ne00 == 6144) {
+                    // ssm_out / attn_output: 29.6 -> 28.2 us (a 32-lane K = 2560 variant gained nothing)
+                    mul_mat_vec_q8_0_repacked_rowu<6, 64><<<ne01, 64, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
+                    break;
+                }
                 if (ne01 >= 512) {
                     const dim3 grid(ne01, 1, 1);
                     mul_mat_vec_q8_0_repacked<1, 1, false><<<grid, 64, 0, stream>>>(
