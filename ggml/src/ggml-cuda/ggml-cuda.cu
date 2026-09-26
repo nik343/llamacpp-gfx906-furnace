@@ -1559,6 +1559,8 @@ static __global__ void __launch_bounds__(1024) gcn_f32_matvec_fewrows(
 
 // one wave per row (MoE router 2560x512, GDN beta/alpha 2560x48): each lane keeps
 // K/256 float4 loads in flight instead of mmvf's 128-thread row loop
+// ITERS > 0: K/4 == ITERS*warp_size, all loads issued before the FMAs (latency-bound otherwise)
+template <int ITERS>
 static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows(
         const float * __restrict__ A, const float * __restrict__ x, float * __restrict__ y,
         const int K, const int64_t lda, const int M) {
@@ -1571,11 +1573,25 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows(
     const float4 * a4 = reinterpret_cast<const float4 *>(A + row * lda);
     const float4 * x4 = reinterpret_cast<const float4 *>(x);
     float acc = 0.0f;
+    if constexpr (ITERS > 0) {
+        float4 a[ITERS];
+        float4 b[ITERS];
+#pragma unroll
+        for (int j = 0; j < ITERS; j++) {
+            a[j] = a4[lane + j * warp_size];
+            b[j] = x4[lane + j * warp_size];
+        }
+#pragma unroll
+        for (int j = 0; j < ITERS; j++) {
+            acc += a[j].x * b[j].x + a[j].y * b[j].y + a[j].z * b[j].z + a[j].w * b[j].w;
+        }
+    } else {
 #pragma unroll 4
     for (int i = lane; i < K / 4; i += warp_size) {
         const float4 a = a4[i];
         const float4 b = x4[i];
         acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
     }
     acc = warp_reduce_sum<warp_size>(acc);
     if (lane == 0) {
@@ -2281,8 +2297,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0 &&
             getenv("GGML_CUDA_NO_F32_ROWS") == nullptr) {
         const int rows_per_block = 256 / warp_size;
-        gcn_f32_matvec_rows<<<(ne01 + rows_per_block - 1) / rows_per_block, 256, 0, ctx.stream()>>>(
-            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) ne00, nb01 / sizeof(float), (int) ne01);
+        const dim3 grid((ne01 + rows_per_block - 1) / rows_per_block);
+        auto args = std::make_tuple((const float *) src0->data, (const float *) src1->data, (float *) dst->data, (int) ne00, (int64_t) (nb01 / sizeof(float)), (int) ne01);
+        if (warp_size == 64 && ne00 == 2560) {
+            std::apply([&](auto... a) { gcn_f32_matvec_rows<10><<<grid, 256, 0, ctx.stream()>>>(a...); }, args);
+        } else {
+            std::apply([&](auto... a) { gcn_f32_matvec_rows<0><<<grid, 256, 0, ctx.stream()>>>(a...); }, args);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
