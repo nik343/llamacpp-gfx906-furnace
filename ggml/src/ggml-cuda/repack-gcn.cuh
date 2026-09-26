@@ -63,3 +63,8 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
 void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
     const ggml_tensor * up_w, const ggml_tensor * gate_w,
     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, int glu_op);
+
+// dense repacked Q8_0 single-column matvec eligible for ggml_cuda_mul_mat_repacked_multi
+bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm);
+// 2-3 such matvecs sharing src1, one launch
+void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n);

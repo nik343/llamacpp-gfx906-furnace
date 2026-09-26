@@ -1234,6 +1234,58 @@ static __global__ void __launch_bounds__(64) mul_mat_vec_q8_0_repacked_rowu(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Up to three dense Q8_0 matvecs that read the same activation (GDN qkv + z, attention
+// q/k/v) in one launch over their concatenated rows; per row identical to
+// mul_mat_vec_q8_0_repacked<1, 1, false>. Saves a launch and its ramp/tail per extra matrix.
+struct q8_multi_args {
+    const uint8_t * w[3];
+    float *         y[3];
+    uint32_t        ne1[3];
+    uint32_t        start[3];
+};
+
+static __global__ void __launch_bounds__(64) mul_mat_vec_q8_0_repacked_multi(
+        const q8_multi_args args, const block_q8_1 * __restrict__ xq, const uint32_t ne0) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int t = blockIdx.x >= args.start[2] ? 2 : (blockIdx.x >= args.start[1] ? 1 : 0);
+    const uint8_t * wbase = args.w[t];
+    const uint32_t  ne1   = args.ne1[t];
+    const uint32_t  row   = blockIdx.x - args.start[t];
+
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const int lane = threadIdx.x;
+
+    float acc = 0.0f;
+    const uint32_t n_half = n_blocks * 2;
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs) + half * 4;
+        const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
+        const uint16_t   db    = d_plane[(size_t) row * nsp + sb];
+        const float      dw    = __half2float(*reinterpret_cast<const __half *>(&db));
+        int idot = 0;
+#pragma unroll
+        for (int g = 0; g < 4; g++) {
+            idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
+        }
+        acc += dw * dx * (float) idot;
+    }
+    acc = warp_reduce_sum<64>(acc);
+    if (lane == 0) {
+        args.y[t][row] = acc;
+    }
+#else
+    GGML_UNUSED_VARS(args, xq, ne0);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 template <bool HAS_IDS>
 static void launch_mul_mat_vec_q8_0_repacked_seg(
         const uint8_t * w, const block_q8_1 * xq, float * y, const int64_t ne00, const int64_t ne01,
@@ -3551,4 +3603,42 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
         initialized[device] = true;
     }
     return &buft_storage[device];
+}
+
+bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm) {
+    static const bool disabled = getenv("GGML_CUDA_NO_Q8_MULTI") != nullptr;
+    if (disabled || mm->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    return w->buffer && ggml_backend_buft_is_cuda_repack(w->buffer->buft) && w->type == GGML_TYPE_Q8_0 &&
+        w->ne[0] == 2560 && w->ne[1] >= 512 && w->ne[2] == 1 && w->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm);
+}
+
+void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n) {
+    GGML_ASSERT(n >= 2 && n <= 3);
+    const ggml_tensor * src1 = mms[0]->src[1];
+    const int64_t ne00 = mms[0]->src[0]->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
+    q8_multi_args args = {};
+    uint32_t rows = 0;
+    for (int i = 0; i < 3; i++) {
+        args.start[i] = rows;
+        if (i < n) {
+            args.w[i]   = (const uint8_t *) mms[i]->src[0]->data;
+            args.y[i]   = (float *) mms[i]->data;
+            args.ne1[i] = (uint32_t) mms[i]->src[0]->ne[1];
+            rows += args.ne1[i];
+        } else {
+            args.start[i] = UINT32_MAX;
+        }
+    }
+    mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
+    CUDA_CHECK(cudaGetLastError());
 }

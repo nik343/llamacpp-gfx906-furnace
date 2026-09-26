@@ -4815,6 +4815,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // (after the GLU fusions, which own gate/up pairs) dense repacked Q8_0 matvecs sharing their activation (grouped by graph_optimize)
+    if (ggml_cuda_repack_q8_multi_ok(node)) {
+        int n = 1;
+        while (n < 3 && i + n < cgraph->n_nodes && ggml_cuda_repack_q8_multi_ok(cgraph->nodes[i + n]) &&
+                cgraph->nodes[i + n]->src[1] == node->src[1] &&
+                cgraph->nodes[i + n]->src[0]->ne[0] == node->src[0]->ne[0] &&
+                (cgraph->nodes[i + n]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            n++;
+        }
+        if (n >= 2) {
+            ggml_cuda_mul_mat_repacked_multi(*cuda_ctx, cgraph->nodes + i, n);
+            return n - 1;
+        }
+    }
+
     return 0;
 }
 
@@ -5249,6 +5264,28 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // move dense repacked Q8_0 matvecs that read the same activation next to each other so
+    // ggml_cuda_try_fuse can run them in one launch (runs before allocation; a moved node only
+    // needs its weight and that activation, both available at the earlier position)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * a = cgraph->nodes[i];
+        if (!ggml_cuda_repack_q8_multi_ok(a)) {
+            continue;
+        }
+        int placed = i;
+        for (int j = i + 1; j < cgraph->n_nodes && placed - i < 2; ++j) {
+            ggml_tensor * b = cgraph->nodes[j];
+            if (b->src[1] != a->src[1] || !ggml_cuda_repack_q8_multi_ok(b) || b->src[0]->ne[0] != a->src[0]->ne[0]) {
+                continue;
+            }
+            for (int k = j; k > placed + 1; --k) {
+                cgraph->nodes[k] = cgraph->nodes[k - 1];
+            }
+            cgraph->nodes[++placed] = b;
+        }
+        i = placed;
+    }
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
