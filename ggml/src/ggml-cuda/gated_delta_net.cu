@@ -330,6 +330,110 @@ __global__ void __launch_bounds__(64) gated_delta_net_lds_wave64(
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// Decode variant (!KDA, S_v = 128, wave64): each wave updates CPW state columns instead of
+// one, so a wave keeps CPW*2 independent state loads in flight and q/k are loaded once
+// per wave. Per-column arithmetic and reduction order match gated_delta_net_cuda.
+template <int CPW, bool keep_rs_t>
+__global__ void __launch_bounds__(256, 2)
+gated_delta_net_cpw(const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * curr_state, float * dst, float * state, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic, float scale,
+        int64_t state_slot_stride, int K, const int32_t * state_rows, int64_t state_row_stride) {
+    constexpr int S_v = 128;
+    constexpr int warp_size = 64;
+    constexpr int rows_per_lane = S_v / warp_size;
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      col0     = (blockIdx.z * blockDim.y + threadIdx.y) * CPW;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
+    const int64_t state_in_offset  = (state_rows ? (int64_t) state_rows[sequence] * state_row_stride
+                                                 : (int64_t) sequence * H * S_v * S_v) + h_idx * S_v * S_v;
+    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    state      += state_out_offset;
+    curr_state += state_in_offset;
+
+    float s_shard[CPW][rows_per_lane];
+#pragma unroll
+    for (int c = 0; c < CPW; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[c][r] = curr_state[(col0 + c) * S_v + r * warp_size + lane];
+        }
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float beta_val = beta[gb_offset];
+        const float g_val    = expf(g[gb_offset]);
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            k_reg[r] = k_t[r * warp_size + lane];
+            q_reg[r] = q_t[r * warp_size + lane];
+        }
+
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            const int col = col0 + c;
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                kv_shard += s_shard[c][r] * k_reg[r];
+            }
+            const float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+            const float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                s_shard[c][r]  = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                attn_partial += s_shard[c][r] * q_reg[r];
+            }
+            const float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            if (lane == 0) {
+                attn_data[col] = attn_col * scale;
+            }
+        }
+        attn_data += S_v * H;
+
+        if constexpr (keep_rs_t) {
+            const int target_slot = (int) n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * cs = state + target_slot * state_slot_stride;
+#pragma unroll
+                for (int c = 0; c < CPW; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        cs[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+                    }
+                }
+            }
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                state[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
+        }
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -360,6 +464,27 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                 sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
                 neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_rows, state_row_stride);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
+#if defined(GGML_USE_HIP)
+    if constexpr (!KDA) {
+        static const int cpw_env = getenv("GGML_CUDA_GDN_CPW") ? atoi(getenv("GGML_CUDA_GDN_CPW")) : 2;
+        if (S_v == 128 && warp_size == 64 && n_tokens == 1 && (cpw_env == 2 || cpw_env == 4)) {
+            const dim3 grid(H, n_seqs, S_v / (num_warps * cpw_env));
+            const dim3 block(64, num_warps, 1);
+            if (cpw_env == 4) {
+                gated_delta_net_cpw<4, keep_rs_t><<<grid, block, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,
+                    state_slot_stride, K, state_rows, state_row_stride);
+            } else {
+                gated_delta_net_cpw<2, keep_rs_t><<<grid, block, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,
+                    state_slot_stride, K, state_rows, state_row_stride);
+            }
             CUDA_CHECK(cudaGetLastError());
             return;
         }
