@@ -3605,17 +3605,23 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
     return &buft_storage[device];
 }
 
-bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm) {
+// structural part only: graph_optimize groups on it, so the node order does not depend on the
+// token count (a count-dependent order differs between ubatches and forces a re-reserve)
+bool ggml_cuda_repack_q8_multi_group(const ggml_tensor * mm) {
     static const bool disabled = getenv("GGML_CUDA_NO_Q8_MULTI") != nullptr;
     if (disabled || mm->op != GGML_OP_MUL_MAT) {
         return false;
     }
     const ggml_tensor * w = mm->src[0];
-    const ggml_tensor * x = mm->src[1];
     return w->buffer && ggml_backend_buft_is_cuda_repack(w->buffer->buft) && w->type == GGML_TYPE_Q8_0 &&
         w->ne[0] == 2560 && w->ne[1] >= 512 && w->ne[2] == 1 && w->ne[3] == 1 &&
-        x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
-        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm);
+        mm->src[1]->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32;
+}
+
+bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm) {
+    const ggml_tensor * x = mm->src[1];
+    return ggml_cuda_repack_q8_multi_group(mm) &&
+        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(mm);
 }
 
 void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n) {

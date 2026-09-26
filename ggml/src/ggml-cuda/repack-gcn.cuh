@@ -66,5 +66,7 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
 
 // dense repacked Q8_0 single-column matvec eligible for ggml_cuda_mul_mat_repacked_multi
 bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm);
+// token-count independent part of it (graph_optimize grouping)
+bool ggml_cuda_repack_q8_multi_group(const ggml_tensor * mm);
 // 2-3 such matvecs sharing src1, one launch
 void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n);

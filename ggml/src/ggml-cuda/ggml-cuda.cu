@@ -1639,17 +1639,23 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi(const f3
     }
 }
 
-static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
+// structural part (graph_optimize grouping; independent of the token count, see
+// ggml_cuda_repack_q8_multi_group)
+static bool ggml_cuda_f32_multi_group(const ggml_tensor * mm) {
     static const bool disabled = getenv("GGML_CUDA_NO_F32_MULTI") != nullptr;
     if (disabled || mm->op != GGML_OP_MUL_MAT) {
         return false;
     }
     const ggml_tensor * w = mm->src[0];
-    const ggml_tensor * x = mm->src[1];
     return w->type == GGML_TYPE_F32 && w->ne[0] == 2560 && w->ne[1] <= 16384 && w->ne[2] == 1 && w->ne[3] == 1 &&
         w->nb[0] == sizeof(float) && w->nb[1] % 16 == 0 && (!w->buffer || !ggml_backend_buft_is_host(w->buffer->buft)) &&
-        x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
-        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm);
+        mm->src[1]->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32;
+}
+
+static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
+    const ggml_tensor * x = mm->src[1];
+    return ggml_cuda_f32_multi_group(mm) &&
+        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(mm);
 }
 #endif // defined(GGML_USE_HIP)
 
@@ -5358,14 +5364,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // needs its weight and that activation, both available at the earlier position)
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * a = cgraph->nodes[i];
-        const int kind = ggml_cuda_repack_q8_multi_ok(a) ? 1 : (ggml_cuda_f32_multi_ok(a) ? 2 : 0);
+        const int kind = ggml_cuda_repack_q8_multi_group(a) ? 1 : (ggml_cuda_f32_multi_group(a) ? 2 : 0);
         if (kind == 0) {
             continue;
         }
         int placed = i;
         for (int j = i + 1; j < cgraph->n_nodes && placed - i < 2; ++j) {
             ggml_tensor * b = cgraph->nodes[j];
-            const bool same_kind = kind == 1 ? ggml_cuda_repack_q8_multi_ok(b) : ggml_cuda_f32_multi_ok(b);
+            const bool same_kind = kind == 1 ? ggml_cuda_repack_q8_multi_group(b) : ggml_cuda_f32_multi_group(b);
             if (b->src[1] != a->src[1] || !same_kind || b->src[0]->ne[0] != a->src[0]->ne[0]) {
                 continue;
             }
