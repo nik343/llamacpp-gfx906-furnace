@@ -1128,6 +1128,59 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_splitk(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// Short rows (NB sub-blocks, NB not a power of two so rows are contiguous): thread t of a
+// 256-thread workgroup takes sub-block t % NB of row t / NB, so every lane loads useful bytes;
+// rows are summed through LDS. At K = 320 (qwen4exp hc up) the segmented kernel leaves 6 of
+// 16 lanes idle: 7.7 -> 7.2 us per call.
+template <int NB>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_flat(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    static_assert((NB & (NB - 1)) != 0, "power-of-two NB has padded rows");
+    constexpr int R = 256 / NB;
+    const int4     * qs4     = reinterpret_cast<const int4 *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * NB * 32);
+    __shared__ float part[R * NB];
+    const int t   = threadIdx.x;
+    const uint32_t row0 = blockIdx.x * R;
+    if (t < R * NB) {
+        const uint32_t row = row0 + t / NB;
+        const int      sb  = t % NB;
+        float acc = 0.0f;
+        if (row < ne1) {
+            const block_q8_1 * xb = xq + sb;
+            const int4 * x4 = reinterpret_cast<const int4 *>(xb->qs);
+            const size_t u = (size_t) row * NB + sb;
+            const int4 w0 = qs4[u * 2 + 0];
+            const int4 w1 = qs4[u * 2 + 1];
+            const int4 a0 = x4[0];
+            const int4 a1 = x4[1];
+            int idot = 0;
+            idot = ggml_cuda_dp4a(w0.x, a0.x, idot); idot = ggml_cuda_dp4a(w0.y, a0.y, idot);
+            idot = ggml_cuda_dp4a(w0.z, a0.z, idot); idot = ggml_cuda_dp4a(w0.w, a0.w, idot);
+            idot = ggml_cuda_dp4a(w1.x, a1.x, idot); idot = ggml_cuda_dp4a(w1.y, a1.y, idot);
+            idot = ggml_cuda_dp4a(w1.z, a1.z, idot); idot = ggml_cuda_dp4a(w1.w, a1.w, idot);
+            const uint16_t db = d_plane[u];
+            acc = __half2float(*reinterpret_cast<const __half *>(&db)) * __low2float(xb->ds) * (float) idot;
+        }
+        part[t] = acc;
+    }
+    __syncthreads();
+    if (t < R && row0 + t < ne1) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NB; j++) {
+            sum += part[t * NB + j];
+        }
+        y[row0 + t] = sum;
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 template <bool HAS_IDS>
 static void launch_mul_mat_vec_q8_0_repacked_seg(
         const uint8_t * w, const block_q8_1 * xq, float * y, const int64_t ne00, const int64_t ne01,
@@ -2719,6 +2772,10 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_Q8_0: {
                 // short rows: several rows per wave (see mul_mat_vec_q8_0_repacked_seg)
+                if (ne00 == 320) {
+                    mul_mat_vec_q8_0_repacked_flat<10><<<(ne01 + 24) / 25, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne01);
+                    break;
+                }
                 if (ne00 <= 1024) {
                     launch_mul_mat_vec_q8_0_repacked_seg<false>(w, xq, dst_d, ne00, ne01, 1, nullptr, 0, 0, 0, stream);
                     break;
