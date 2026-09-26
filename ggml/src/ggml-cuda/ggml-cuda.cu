@@ -1598,6 +1598,59 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows(
         y[row] = acc;
     }
 }
+
+// Up to three F32 single-column matvecs over the same x (K = 2560): GDN beta + alpha, MoE
+// router + shared-expert gate. One wave per row as in gcn_f32_matvec_rows<10>.
+struct f32_multi_args {
+    const float * A[3];
+    float *       y[3];
+    int64_t       lda[3];
+    uint32_t      rows[3];
+    uint32_t      start[3];
+};
+
+static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi(const f32_multi_args args, const float * __restrict__ x) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int ITERS = 2560 / 4 / warp_size;
+    const uint32_t gw   = blockIdx.x * (256 / warp_size) + threadIdx.x / warp_size;
+    const int      lane = threadIdx.x % warp_size;
+    const int t = gw >= args.start[2] ? 2 : (gw >= args.start[1] ? 1 : 0);
+    const uint32_t row = gw - args.start[t];
+    if (row >= args.rows[t]) {
+        return;
+    }
+    const float4 * a4 = reinterpret_cast<const float4 *>(args.A[t] + row * args.lda[t]);
+    const float4 * x4 = reinterpret_cast<const float4 *>(x);
+    float4 a[ITERS];
+    float4 b[ITERS];
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        a[j] = a4[lane + j * warp_size];
+        b[j] = x4[lane + j * warp_size];
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        acc += a[j].x * b[j].x + a[j].y * b[j].y + a[j].z * b[j].z + a[j].w * b[j].w;
+    }
+    acc = warp_reduce_sum<warp_size>(acc);
+    if (lane == 0) {
+        args.y[t][row] = acc;
+    }
+}
+
+static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
+    static const bool disabled = getenv("GGML_CUDA_NO_F32_MULTI") != nullptr;
+    if (disabled || mm->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    return w->type == GGML_TYPE_F32 && w->ne[0] == 2560 && w->ne[1] <= 16384 && w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->nb[0] == sizeof(float) && w->nb[1] % 16 == 0 && (!w->buffer || !ggml_backend_buft_is_host(w->buffer->buft)) &&
+        x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm);
+}
 #endif // defined(GGML_USE_HIP)
 
 // F32 GEMMs launched on GCN (gfx906), where rocBLAS on ROCm 7.1 ships no gfx906 Tensile for
@@ -4830,6 +4883,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#if defined(GGML_USE_HIP)
+    // F32 single-column matvecs sharing their x (grouped by graph_optimize)
+    if (ggml_cuda_f32_multi_ok(node) && ggml_cuda_info().devices[cuda_ctx->device].warp_size == 64) {
+        int n = 1;
+        while (n < 3 && i + n < cgraph->n_nodes && ggml_cuda_f32_multi_ok(cgraph->nodes[i + n]) &&
+                cgraph->nodes[i + n]->src[1] == node->src[1] && (cgraph->nodes[i + n]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            n++;
+        }
+        bool aligned = (uintptr_t) node->src[1]->data % 16 == 0;
+        for (int k = 0; k < n; k++) {
+            aligned &= (uintptr_t) cgraph->nodes[i + k]->src[0]->data % 16 == 0;
+        }
+        if (n >= 2 && aligned) {
+            f32_multi_args args = {};
+            uint32_t waves = 0;
+            for (int k = 0; k < 3; k++) {
+                args.start[k] = waves;
+                if (k < n) {
+                    const ggml_tensor * mm = cgraph->nodes[i + k];
+                    args.A[k]    = (const float *) mm->src[0]->data;
+                    args.y[k]    = (float *) mm->data;
+                    args.lda[k]  = mm->src[0]->nb[1] / sizeof(float);
+                    args.rows[k] = (uint32_t) mm->src[0]->ne[1];
+                    waves += args.rows[k];
+                } else {
+                    args.start[k] = UINT32_MAX;
+                }
+            }
+            gcn_f32_matvec_rows_multi<<<(waves + 3) / 4, 256, 0, cuda_ctx->stream()>>>(args, (const float *) node->src[1]->data);
+            CUDA_CHECK(cudaGetLastError());
+            return n - 1;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     return 0;
 }
 
@@ -5270,13 +5358,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // needs its weight and that activation, both available at the earlier position)
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * a = cgraph->nodes[i];
-        if (!ggml_cuda_repack_q8_multi_ok(a)) {
+        const int kind = ggml_cuda_repack_q8_multi_ok(a) ? 1 : (ggml_cuda_f32_multi_ok(a) ? 2 : 0);
+        if (kind == 0) {
             continue;
         }
         int placed = i;
         for (int j = i + 1; j < cgraph->n_nodes && placed - i < 2; ++j) {
             ggml_tensor * b = cgraph->nodes[j];
-            if (b->src[1] != a->src[1] || !ggml_cuda_repack_q8_multi_ok(b) || b->src[0]->ne[0] != a->src[0]->ne[0]) {
+            const bool same_kind = kind == 1 ? ggml_cuda_repack_q8_multi_ok(b) : ggml_cuda_f32_multi_ok(b);
+            if (b->src[1] != a->src[1] || !same_kind || b->src[0]->ne[0] != a->src[0]->ne[0]) {
                 continue;
             }
             for (int k = j; k > placed + 1; --k) {
