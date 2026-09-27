@@ -3084,7 +3084,7 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const int64_t x_stride, cudaStream_t stream) {
     static const bool no_nc = getenv("GGML_CUDA_NO_Q8_NC") != nullptr;
-    if (!no_nc && src0->type == GGML_TYPE_Q8_0 && ne11 >= 2 && ne11 <= 8) {
+    if (!no_nc && src0->type == GGML_TYPE_Q8_0 && ne11 >= 2 && ne11 <= 16) {
         const int64_t nb = ne00 / 32;
         auto launch = [&](auto nc) {
             constexpr int NC = decltype(nc)::value;
@@ -3104,7 +3104,15 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             case 5:  launch(std::integral_constant<int, 5>{}); break;
             case 6:  launch(std::integral_constant<int, 6>{}); break;
             case 7:  launch(std::integral_constant<int, 7>{}); break;
-            default: launch(std::integral_constant<int, 8>{}); break;
+            case 8:  launch(std::integral_constant<int, 8>{}); break;
+            case 9:  launch(std::integral_constant<int, 9>{}); break;
+            case 10: launch(std::integral_constant<int, 10>{}); break;
+            case 11: launch(std::integral_constant<int, 11>{}); break;
+            case 12: launch(std::integral_constant<int, 12>{}); break;
+            case 13: launch(std::integral_constant<int, 13>{}); break;
+            case 14: launch(std::integral_constant<int, 14>{}); break;
+            case 15: launch(std::integral_constant<int, 15>{}); break;
+            default: launch(std::integral_constant<int, 16>{}); break;
         }
         return;
     }
@@ -3434,7 +3442,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // a few tokens (speculative verify): run the per-slot decode kernels over all n_tokens*n_used slots
     // instead of the routed tile GEMM, whose fixed cost dominates at this size
     static const bool no_small = getenv("GGML_CUDA_NO_MOE_SMALL") != nullptr;
-    const bool small = !no_small && n_tokens > 1 && n_tokens <= 8 &&
+    const bool small = !no_small && n_tokens > 1 && n_tokens <= 16 &&
         (src1->ne[1] == 1 || (src1->ne[1] == n_expert_used && sis1 == n_expert_used));
 
     // batch: grouped tile GEMM, thin 16-token tiles (MoE routing spreads
@@ -3714,7 +3722,7 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
     if (up->src[2] != nullptr) { // MUL_MAT_ID: one token, or a few with one shared column per token
         static const bool no_small = getenv("GGML_CUDA_NO_MOE_SMALL") != nullptr;
         const int64_t n_tokens = up->src[1]->ne[2];
-        return glu->ne[2] == n_tokens && (n_tokens == 1 || (!no_small && n_tokens <= 8 && up->src[1]->ne[1] == 1));
+        return glu->ne[2] == n_tokens && (n_tokens == 1 || (!no_small && n_tokens <= 16 && up->src[1]->ne[1] == 1));
     }
     return up->src[1]->ne[1] == 1; // dense: one column
 }

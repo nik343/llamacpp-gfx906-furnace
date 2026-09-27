@@ -2416,7 +2416,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 #if defined(GGML_USE_HIP)
     // 2-8 columns (speculative verify): the same two shapes, each weight row read once for all columns
-    if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && ne00 >= 1024 &&
+    if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 16 && ne00 >= 1024 &&
             ne00 % 4 == 0 && ne01 <= 16384 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             nb00 == sizeof(float) && nb10 == sizeof(float) && nb01 % 16 == 0 && nb11 % 16 == 0 && nb0 == sizeof(float) &&
             (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0 &&
@@ -2444,7 +2444,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             case 5:  launch(std::integral_constant<int, 5>{}); break;
             case 6:  launch(std::integral_constant<int, 6>{}); break;
             case 7:  launch(std::integral_constant<int, 7>{}); break;
-            default: launch(std::integral_constant<int, 8>{}); break;
+            case 8:  launch(std::integral_constant<int, 8>{}); break;
+            case 9:  launch(std::integral_constant<int, 9>{}); break;
+            case 10: launch(std::integral_constant<int, 10>{}); break;
+            case 11: launch(std::integral_constant<int, 11>{}); break;
+            case 12: launch(std::integral_constant<int, 12>{}); break;
+            case 13: launch(std::integral_constant<int, 13>{}); break;
+            case 14: launch(std::integral_constant<int, 14>{}); break;
+            case 15: launch(std::integral_constant<int, 15>{}); break;
+            default: launch(std::integral_constant<int, 16>{}); break;
         }
         CUDA_CHECK(cudaGetLastError());
         return;
