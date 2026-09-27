@@ -10232,6 +10232,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
+    // one column per broadcast slice (qwen4exp GDN output with several sequences)
+    for (int bs : {2, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 6144, {bs, 1}, {1, 1}));
+    }
     // few long F32 rows, one token (qwen4exp hc inject 10240 -> 4) and edges (K % 4 != 0 falls back)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,  4, 1, 10240, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 1,  2048, {1, 1}, {1, 1}));
