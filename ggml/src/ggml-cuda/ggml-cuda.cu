@@ -4317,6 +4317,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SCALE -> SILU -> MUL_MAT(hc up) -> RESHAPE -> DSV4_HC_PRE (qwen4exp hc mix, one token)
+    if (node->op == GGML_OP_SCALE && i + 4 < cgraph->n_nodes) {
+        ggml_tensor * silu = cgraph->nodes[i + 1];
+        ggml_tensor * up   = cgraph->nodes[i + 2];
+        ggml_tensor * rs   = cgraph->nodes[i + 3];
+        ggml_tensor * pre  = cgraph->nodes[i + 4];
+        if (silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node &&
+                up->op == GGML_OP_MUL_MAT && rs->op == GGML_OP_RESHAPE && rs->src[0] == up &&
+                pre->op == GGML_OP_DSV4_HC_PRE && pre->src[1] == rs &&
+                ggml_node_get_use_count(cgraph, i) == 1 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 2) == 1 && ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+                (silu->flags & GGML_TENSOR_FLAG_COMPUTE) && (up->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (pre->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_hc_up_pre_ok(node, silu, up, pre)) {
+            const int out_idx = i + 4;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, &out_idx, 1)) {
+                ggml_cuda_hc_up_pre(*cuda_ctx, node, up, pre, ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, pre));
+                return 4;
+            }
+        }
+    }
+
     // SCALE -> SILU (qwen4exp hc mix)
     if (node->op == GGML_OP_SCALE && ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&

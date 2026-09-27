@@ -70,3 +70,8 @@ bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm);
 bool ggml_cuda_repack_q8_multi_group(const ggml_tensor * mm);
 // 2-3 such matvecs sharing src1, one launch
 void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n);
+
+// qwen4exp hc mix tail at decode: SCALE -> SILU -> MUL_MAT(repacked Q8_0 hc up, K = 320) -> DSV4_HC_PRE
+bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre);
+void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * up,
+        ggml_tensor * pre, void * yq);

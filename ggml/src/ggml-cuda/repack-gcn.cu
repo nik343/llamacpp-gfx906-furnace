@@ -3726,3 +3726,153 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
     mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// qwen4exp hyper-connection mix, after the down projection (one token):
+//   SCALE -> SILU -> MUL_MAT(hc up, repacked Q8_0, K = 320) -> DSV4_HC_PRE(gated, 4 streams)
+// A block quantizes silu(s*lo + b) itself (scale_silu_f32's arithmetic), computes the 4 stream rows of
+// 32 output dims (mul_mat_vec_q8_0_repacked_flat<10>'s per-sub-block dots and sum order) and mixes them
+// as dsv4_hc_pre_f32 does, so the result is bitwise that of the three launches it replaces.
+static constexpr int HC_UP_K  = 320;
+static constexpr int HC_UP_NB = HC_UP_K/32;
+static constexpr int HC_UP_HC = 4;
+static constexpr int HC_UP_D  = 32; // output dims per block
+
+static __global__ void __launch_bounds__(256) hc_up_pre_f32(
+        const float * __restrict__ lo, const float scale, const float bias,
+        const uint8_t * __restrict__ wbase, const uint32_t ne1,
+        const float * __restrict__ xn, const int64_t sx1,
+        const float pre_scale, float * __restrict__ dst, block_q8_1 * __restrict__ yq, const int64_t n_embd) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    constexpr int ROWS = HC_UP_HC*HC_UP_D;
+    __shared__ block_q8_1 aq[HC_UP_NB];
+    __shared__ float      part[ROWS*HC_UP_NB];
+    __shared__ float      gate[ROWS];
+
+    const int t = threadIdx.x;
+
+    const int4     * qs4     = reinterpret_cast<const int4 *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * HC_UP_NB * 32);
+    const int64_t d0 = (int64_t) blockIdx.x * HC_UP_D;
+
+    // 1280 (row, sub-block) items over 256 threads: all five weight loads of a thread go out
+    // together, ahead of the activation quantize
+    static_assert(ROWS*HC_UP_NB == 5*256, "five items per thread");
+    int4     w0[5];
+    int4     w1[5];
+    uint16_t db[5];
+#pragma unroll
+    for (int k = 0; k < 5; ++k) {
+        const int item = t + 256*k;
+        const int r    = item / HC_UP_NB;
+        const int sb   = item % HC_UP_NB;
+        const size_t row = (size_t) (r / HC_UP_D) * n_embd + d0 + r % HC_UP_D;
+        const size_t u   = row * HC_UP_NB + sb;
+        w0[k] = qs4[u * 2 + 0];
+        w1[k] = qs4[u * 2 + 1];
+        db[k] = d_plane[u];
+    }
+
+    for (int i = t; i < HC_UP_K; i += blockDim.x) {
+        const float v = ggml_cuda_op_silu_single(scale * lo[i] + bias);
+        float amax = fabsf(v);
+        float sum  = v;
+        amax = warp_reduce_max<QK8_1>(amax);
+        sum  = warp_reduce_sum<QK8_1>(sum);
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+        aq[i / QK8_1].qs[i % QK8_1] = q;
+        if (i % QK8_1 == 0) {
+            aq[i / QK8_1].ds = make_half2(d, sum);
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < 5; ++k) {
+        const int item = t + 256*k;
+        const int sb   = item % HC_UP_NB;
+        const block_q8_1 * xb = aq + sb;
+        const int4 * x4 = reinterpret_cast<const int4 *>(xb->qs);
+        const int4 a0 = x4[0];
+        const int4 a1 = x4[1];
+        int idot = 0;
+        idot = ggml_cuda_dp4a(w0[k].x, a0.x, idot); idot = ggml_cuda_dp4a(w0[k].y, a0.y, idot);
+        idot = ggml_cuda_dp4a(w0[k].z, a0.z, idot); idot = ggml_cuda_dp4a(w0[k].w, a0.w, idot);
+        idot = ggml_cuda_dp4a(w1[k].x, a1.x, idot); idot = ggml_cuda_dp4a(w1[k].y, a1.y, idot);
+        idot = ggml_cuda_dp4a(w1[k].z, a1.z, idot); idot = ggml_cuda_dp4a(w1[k].w, a1.w, idot);
+        part[item] = __half2float(*reinterpret_cast<const __half *>(&db[k])) * __low2float(xb->ds) * (float) idot;
+    }
+    __syncthreads();
+
+    if (t < ROWS) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < HC_UP_NB; j++) {
+            sum += part[t * HC_UP_NB + j];
+        }
+        gate[t] = sum;
+    }
+    __syncthreads();
+
+    if (t < HC_UP_D) {
+        const int64_t i0 = d0 + t;
+        float sum = 0.0f;
+        for (int ih = 0; ih < HC_UP_HC; ++ih) {
+            const float xv = xn[i0 + ih*sx1];
+            const float wv = 1.0f / (1.0f + expf(-gate[ih*HC_UP_D + t]));
+            sum += xv * wv;
+        }
+        const float v = pre_scale * sum;
+        dst[i0] = v;
+        if (yq != nullptr) {
+            float amax = fabsf(v);
+            float bsum = v;
+            amax = warp_reduce_max<QK8_1>(amax);
+            bsum = warp_reduce_sum<QK8_1>(bsum);
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+            yq[i0 / QK8_1].qs[i0 % QK8_1] = q;
+            if (i0 % QK8_1 == 0) {
+                yq[i0 / QK8_1].ds = make_half2(d, bsum);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(lo, scale, bias, wbase, ne1, xn, sx1, pre_scale, dst, yq, n_embd);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre) {
+    static const bool disabled = getenv("GGML_CUDA_NO_HC_UP_PRE") != nullptr;
+    const ggml_tensor * w  = up->src[0];
+    const ggml_tensor * lo = scale->src[0];
+    const ggml_tensor * xn = pre->src[0];
+    if (disabled || !w->buffer || !ggml_backend_buft_is_cuda_repack(w->buffer->buft) || w->type != GGML_TYPE_Q8_0 ||
+            w->ne[0] != HC_UP_K || w->ne[2] != 1 || w->ne[3] != 1 || up->src[1] != silu) {
+        return false;
+    }
+    const bool gated = ggml_get_op_params_i32(pre, 1) != 0;
+    const int64_t n_embd = pre->ne[0];
+    return gated && lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) && ggml_nelements(lo) == HC_UP_K &&
+        up->type == GGML_TYPE_F32 && ggml_nelements(up) == w->ne[1] && xn->type == GGML_TYPE_F32 &&
+        xn->ne[0] == n_embd && xn->ne[1] == HC_UP_HC && xn->ne[2] == 1 && xn->nb[0] == sizeof(float) &&
+        w->ne[1] == HC_UP_HC*n_embd && n_embd % HC_UP_D == 0 && pre->ne[1] == 1 && pre->ne[2] == 1 &&
+        pre->type == GGML_TYPE_F32 && ggml_is_contiguous(pre) && pre->src[1]->ne[1] == HC_UP_HC;
+}
+
+void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * up,
+        ggml_tensor * pre, void * yq) {
+    float s;
+    float b;
+    memcpy(&s, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale->op_params + 1, sizeof(float));
+    const float pre_scale = ggml_get_op_params_f32(pre, 0);
+
+    const ggml_tensor * xn = pre->src[0];
+    const int64_t n_embd = pre->ne[0];
+    hc_up_pre_f32<<<n_embd / HC_UP_D, 256, 0, ctx.stream()>>>(
+        (const float *) scale->src[0]->data, s, b, (const uint8_t *) up->src[0]->data, (uint32_t) up->src[0]->ne[1],
+        (const float *) xn->data, xn->nb[1] / sizeof(float), pre_scale, (float *) pre->data, (block_q8_1 *) yq, n_embd);
+    CUDA_CHECK(cudaGetLastError());
+}
