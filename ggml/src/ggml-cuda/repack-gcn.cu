@@ -2862,6 +2862,127 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? 2 : 3) mmq_gemm_q8_0_rep
 // MUL_MAT dispatch
 // ---------------------------------------------------------------------
 
+// Few long rows (qwen4exp hc down, 320 x 10240) with NC columns: a 256-thread workgroup per row, K split
+// over the threads as in mul_mat_vec_q8_0_repacked_splitk
+template <int NC>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_splitk_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+
+    const uint32_t row = blockIdx.x;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+    for (uint32_t hb = threadIdx.x; hb < n_blocks * 2; hb += 256) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const int4 w = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        const float    dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+            const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+            int idot = 0;
+            idot = ggml_cuda_dp4a(w.x, a.x, idot); idot = ggml_cuda_dp4a(w.y, a.y, idot);
+            idot = ggml_cuda_dp4a(w.z, a.z, idot); idot = ggml_cuda_dp4a(w.w, a.w, idot);
+            acc[c] += dw * __low2float(xb->ds) * (float) idot;
+        }
+    }
+    __shared__ float part[NC][4];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<64>(acc[c]);
+        if ((threadIdx.x & 63) == 0) {
+            part[c][threadIdx.x >> 6] = v;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < NC) {
+        const int c = threadIdx.x;
+        y[(size_t) c * ne1 + row] = part[c][0] + part[c][1] + part[c][2] + part[c][3];
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Short rows (up to 32 sub-blocks: hc up K = 320, shared-expert down K = 640) with NC columns: thread
+// t of a workgroup takes whole sub-block t % nb of row t / nb, so no lane idles on a short row; the
+// per-row sums go through LDS
+template <int NC>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_flat_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t nb  = ne0 >> 5;
+    const uint32_t nsp = ((nb & (nb - 1u)) == 0u) ? (nb + 1u) : nb;
+    const int4     * qs4     = reinterpret_cast<const int4 *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const uint32_t R    = 256 / nb;
+    const uint32_t t    = threadIdx.x;
+    const uint32_t row0 = blockIdx.x * R;
+    __shared__ float part[NC][256];
+
+    if (t < R * nb) {
+        const uint32_t row = row0 + t / nb;
+        const uint32_t sb  = t % nb;
+        float acc[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            acc[c] = 0.0f;
+        }
+        if (row < ne1) {
+            const size_t u = (size_t) row * nsp + sb;
+            const int4 w0 = qs4[u * 2 + 0];
+            const int4 w1 = qs4[u * 2 + 1];
+            const uint16_t db = d_plane[u];
+            const float    dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+                const int4 * x4 = reinterpret_cast<const int4 *>(xb->qs);
+                const int4 a0 = x4[0];
+                const int4 a1 = x4[1];
+                int idot = 0;
+                idot = ggml_cuda_dp4a(w0.x, a0.x, idot); idot = ggml_cuda_dp4a(w0.y, a0.y, idot);
+                idot = ggml_cuda_dp4a(w0.z, a0.z, idot); idot = ggml_cuda_dp4a(w0.w, a0.w, idot);
+                idot = ggml_cuda_dp4a(w1.x, a1.x, idot); idot = ggml_cuda_dp4a(w1.y, a1.y, idot);
+                idot = ggml_cuda_dp4a(w1.z, a1.z, idot); idot = ggml_cuda_dp4a(w1.w, a1.w, idot);
+                acc[c] = dw * __low2float(xb->ds) * (float) idot;
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            part[c][t] = acc[c];
+        }
+    }
+    __syncthreads();
+    for (uint32_t i = t; i < R * NC; i += blockDim.x) {
+        const uint32_t r = i % R;
+        const uint32_t c = i / R;
+        if (row0 + r < ne1) {
+            float sum = 0.0f;
+            for (uint32_t j = 0; j < nb; j++) {
+                sum += part[c][r * nb + j];
+            }
+            y[(size_t) c * ne1 + row0 + r] = sum;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Dense Q8_0 with a few activation columns (speculative verify, 2-8 tokens): one wave per row, each
 // weight half-sub-block is loaded once and dotted with every column. The tiled MMQ GEMM costs
 // ~135 us per call at N = 2 against ~30 us here.
@@ -2964,10 +3085,17 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const int64_t x_stride, cudaStream_t stream) {
     static const bool no_nc = getenv("GGML_CUDA_NO_Q8_NC") != nullptr;
     if (!no_nc && src0->type == GGML_TYPE_Q8_0 && ne11 >= 2 && ne11 <= 8) {
-        const dim3 grid((ne01 + 3) / 4, 1, 1);
+        const int64_t nb = ne00 / 32;
         auto launch = [&](auto nc) {
             constexpr int NC = decltype(nc)::value;
-            mul_mat_vec_q8_0_repacked_nc<NC><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+            if (ne01 <= 1024 && ne00 >= 4096) {
+                mul_mat_vec_q8_0_repacked_splitk_nc<NC><<<ne01, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+            } else if (nb <= 32) {
+                const int64_t R = 256 / nb;
+                mul_mat_vec_q8_0_repacked_flat_nc<NC><<<(ne01 + R - 1) / R, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+            } else {
+                mul_mat_vec_q8_0_repacked_nc<NC><<<(ne01 + 3) / 4, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+            }
         };
         switch (ne11) {
             case 2:  launch(std::integral_constant<int, 2>{}); break;
@@ -3583,8 +3711,10 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
     if (op != GGML_GLU_OP_SWIGLU && op != GGML_GLU_OP_GEGLU) {
         return false;
     }
-    if (up->src[2] != nullptr) { // MUL_MAT_ID: one token
-        return up->src[1]->ne[2] == 1 && glu->ne[2] == 1;
+    if (up->src[2] != nullptr) { // MUL_MAT_ID: one token, or a few with one shared column per token
+        static const bool no_small = getenv("GGML_CUDA_NO_MOE_SMALL") != nullptr;
+        const int64_t n_tokens = up->src[1]->ne[2];
+        return glu->ne[2] == n_tokens && (n_tokens == 1 || (!no_small && n_tokens <= 8 && up->src[1]->ne[1] == 1));
     }
     return up->src[1]->ne[1] == 1; // dense: one column
 }
@@ -3629,20 +3759,39 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
     // MoE decode: same routing machinery as the unfused ID path
     const int64_t ne02 = up_w->ne[2];
     const int64_t n_expert_used = ids->ne[0];
-    const int64_t n_assign = n_expert_used; // one token
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_assign = n_expert_used * n_tokens;
     const size_t expert_stride = repack_gcn_nbytes(up_w->type, ne00, ne01);
     GGML_ASSERT(dst->nb[1] == (size_t) dst->ne[0] * sizeof(float));
+    GGML_ASSERT(dst->nb[2] == dst->nb[1] * dst->ne[1]);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
-    GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(src1->ne[2] == n_tokens && src1->ne[3] == 1);
+    GGML_ASSERT(n_tokens == 1 || src1->ne[1] == 1);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
-    const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
+    uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
+    const int32_t * ids_d = (const int32_t *) ids->data;
+    ggml_cuda_pool_alloc<int32_t>    ids_flat(ctx.pool());
+    ggml_cuda_pool_alloc<block_q8_1> x_slots(ctx.pool());
+    if (n_tokens > 1) {
+        // a few tokens: flat ids, one activation column per (token, expert) slot
+        if (ids->nb[1] != n_expert_used * sizeof(int32_t)) {
+            ids_flat.alloc(n_assign);
+            CUDA_CHECK(cudaMemcpy2DAsync(ids_flat.get(), n_expert_used * sizeof(int32_t), ids->data, ids->nb[1],
+                n_expert_used * sizeof(int32_t), n_tokens, cudaMemcpyDeviceToDevice, stream));
+            ids_d = ids_flat.get();
+        }
+        x_slots.alloc(n_assign * x_stride);
+        repack_expand_x_slots<<<n_assign, 256, 0, stream>>>(xq, x_slots.get(), (int) x_stride, (int) n_expert_used);
+        xq = x_slots.get();
+        xs_eff = (uint32_t) x_stride;
+    }
     static const bool glu16 = getenv("GGML_CUDA_NO_Q4K_GLU16") == nullptr;
     if (glu16 && ne00 == 2560) {
         const dim3 grid16((ne01 + 15) / 16, n_assign, 1);
         mul_mat_vec_q4k_repacked_glu16<5><<<grid16, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne01, glu_op,
-            (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1);
+            ids_d, expert_stride, xs_eff, dst_s1);
         return;
     }
     // one row per wave: the 2-row kernel needs 51 VGPRs (4 waves/SIMD) and is
@@ -3650,7 +3799,7 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
     const dim3 grid((ne01 + 3) / 4, n_assign, 1);
     mul_mat_vec_q4k_repacked_glu<true, 1><<<grid, 256, 0, stream>>>(
         wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op,
-        (const int32_t *) ids->data, nullptr, nullptr, (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
+        ids_d, nullptr, nullptr, (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
 }
 
 // ---------------------------------------------------------------------

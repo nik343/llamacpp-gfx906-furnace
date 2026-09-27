@@ -1599,6 +1599,80 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows(
     }
 }
 
+// the two kernels above for 2-8 columns (speculative verify): each weight row is read once for all columns
+template <int NC>
+static __global__ void __launch_bounds__(1024) gcn_f32_matvec_fewrows_nc(
+        const float * __restrict__ A, const float * __restrict__ x, float * __restrict__ y,
+        const int K, const int64_t lda, const int64_t sx, const int64_t sy) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const float4 * a4 = reinterpret_cast<const float4 *>(A + blockIdx.x * lda);
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+    for (int i = threadIdx.x; i < K / 4; i += 1024) {
+        const float4 a = a4[i];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float4 b = reinterpret_cast<const float4 *>(x + c * sx)[i];
+            acc[c] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    }
+    __shared__ float part[NC][1024 / warp_size];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<warp_size>(acc[c]);
+        if (threadIdx.x % warp_size == 0) {
+            part[c][threadIdx.x / warp_size] = v;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < NC) {
+        const int c = threadIdx.x;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 1024 / warp_size; w++) {
+            sum += part[c][w];
+        }
+        y[c * sy + blockIdx.x] = sum;
+    }
+}
+
+template <int NC>
+static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_nc(
+        const float * __restrict__ A, const float * __restrict__ x, float * __restrict__ y,
+        const int K, const int64_t lda, const int M, const int64_t sx, const int64_t sy) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x * (256 / warp_size) + threadIdx.x / warp_size;
+    const int lane = threadIdx.x % warp_size;
+    if (row >= M) {
+        return;
+    }
+    const float4 * a4 = reinterpret_cast<const float4 *>(A + row * lda);
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+#pragma unroll 2
+    for (int i = lane; i < K / 4; i += warp_size) {
+        const float4 a = a4[i];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float4 b = reinterpret_cast<const float4 *>(x + c * sx)[i];
+            acc[c] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<warp_size>(acc[c]);
+        if (lane == 0) {
+            y[c * sy + row] = v;
+        }
+    }
+}
+
 // Up to three F32 single-column matvecs over the same x (K = 2560): GDN beta + alpha, MoE
 // router + shared-expert gate. One wave per row as in gcn_f32_matvec_rows<10>.
 struct f32_multi_args {
@@ -2341,6 +2415,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
 #if defined(GGML_USE_HIP)
+    // 2-8 columns (speculative verify): the same two shapes, each weight row read once for all columns
+    if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 >= 2 && ne11 <= 8 && ne00 >= 1024 &&
+            ne00 % 4 == 0 && ne01 <= 16384 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            nb00 == sizeof(float) && nb10 == sizeof(float) && nb01 % 16 == 0 && nb11 % 16 == 0 && nb0 == sizeof(float) &&
+            (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0 &&
+            getenv("GGML_CUDA_NO_F32_NC") == nullptr) {
+        const float * A  = (const float *) src0->data;
+        const float * x  = (const float *) src1->data;
+        float       * y  = (float *) dst->data;
+        const int64_t lda = nb01 / sizeof(float);
+        const int64_t sx  = nb11 / sizeof(float);
+        const int64_t sy  = nb1  / sizeof(float);
+        const int rows_per_block = 256 / warp_size;
+        auto launch = [&](auto nc) {
+            constexpr int NC = decltype(nc)::value;
+            if (ne01 <= 16 && ne00 >= 2048) {
+                gcn_f32_matvec_fewrows_nc<NC><<<ne01, 1024, 0, ctx.stream()>>>(A, x, y, (int) ne00, lda, sx, sy);
+            } else {
+                gcn_f32_matvec_rows_nc<NC><<<(ne01 + rows_per_block - 1) / rows_per_block, 256, 0, ctx.stream()>>>(
+                    A, x, y, (int) ne00, lda, (int) ne01, sx, sy);
+            }
+        };
+        switch (ne11) {
+            case 2:  launch(std::integral_constant<int, 2>{}); break;
+            case 3:  launch(std::integral_constant<int, 3>{}); break;
+            case 4:  launch(std::integral_constant<int, 4>{}); break;
+            case 5:  launch(std::integral_constant<int, 5>{}); break;
+            case 6:  launch(std::integral_constant<int, 6>{}); break;
+            case 7:  launch(std::integral_constant<int, 7>{}); break;
+            default: launch(std::integral_constant<int, 8>{}); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (GGML_CUDA_CC_IS_GCN(cc) && src0->type == GGML_TYPE_F32 && ne11 == 1 && ne01 <= 16 && ne00 >= 2048 &&
             ne00 % 4 == 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             nb00 == sizeof(float) && nb10 == sizeof(float) && nb01 % 16 == 0 && nb0 == sizeof(float) &&
