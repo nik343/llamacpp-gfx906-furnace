@@ -78,6 +78,32 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     }
 }
 
+// lane exchange for the argmax butterfly. On GCN the __shfl_xor lowering is an LDS bpermute per
+// step, 20 dependent round trips per selection round; DPP/swizzle moves carry the same values
+template <int off>
+static __device__ __forceinline__ int topk_moe_xfer(const int x) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    return ggml_gcn_xfer_xor_i32<off>(x);
+#else
+    return __shfl_xor_sync(0xFFFFFFFF, x, off, WARP_SIZE);
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+template <int off>
+static __device__ __forceinline__ float topk_moe_xfer(const float x) {
+    return __int_as_float(topk_moe_xfer<off>(__float_as_int(x)));
+}
+
+template <int off>
+static __device__ __forceinline__ void topk_moe_argmax_step(float & max_val, int & max_expert) {
+    const float val    = topk_moe_xfer<off>(max_val);
+    const int   expert = topk_moe_xfer<off>(max_expert);
+    if (val > max_val || (val == max_val && expert < max_expert)) {
+        max_val    = val;
+        max_expert = expert;
+    }
+}
+
 /*
     This kernel does the following:
     1. optionally softmax over the logits per token [n_experts, n_tokens]
@@ -179,6 +205,9 @@ __global__ void topk_moe_cuda(const float *         logits,
         output_weights[i] = 0.f;
     }
 
+    static_assert(experts_per_thread <= 32, "taken mask holds one bit per slot");
+    uint32_t taken = 0;
+
     ggml_cuda_pdl_lc();
     for (int k = 0; k < n_expert_used; k++) {
         float max_val    = wt[0];
@@ -213,27 +242,30 @@ __global__ void topk_moe_cuda(const float *         logits,
                 selection_wt[max_expert / WARP_SIZE] = -INFINITY;
             }
         } else {
+            // taken experts are skipped through a bit mask: storing -inf at a data-dependent
+            // register index is a waterfall loop on GCN
+            if (taken & 1u) {
+                max_val = -INFINITY;
+            }
 #pragma unroll
             for (int i = 1; i < experts_per_thread; i++) {
                 const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
-                    max_val    = wt[i];
+                const float v = (taken >> i) & 1u ? -INFINITY : wt[i];
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && v > max_val) {
+                    max_val    = v;
                     max_expert = expert;
                 }
             }
 
-#pragma unroll
-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val > max_val || (val == max_val && expert < max_expert)) {
-                    max_val    = val;
-                    max_expert = expert;
-                }
-            }
+            static_assert(WARP_SIZE == 32, "butterfly below is written for 32 lanes");
+            topk_moe_argmax_step<16>(max_val, max_expert);
+            topk_moe_argmax_step< 8>(max_val, max_expert);
+            topk_moe_argmax_step< 4>(max_val, max_expert);
+            topk_moe_argmax_step< 2>(max_val, max_expert);
+            topk_moe_argmax_step< 1>(max_val, max_expert);
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
+                taken |= 1u << (max_expert / WARP_SIZE);
             }
         }
 
