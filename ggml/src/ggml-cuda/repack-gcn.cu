@@ -2862,6 +2862,59 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? 2 : 3) mmq_gemm_q8_0_rep
 // MUL_MAT dispatch
 // ---------------------------------------------------------------------
 
+// Dense Q8_0 with a few activation columns (speculative verify, 2-8 tokens): one wave per row, each
+// weight half-sub-block is loaded once and dotted with every column. The tiled MMQ GEMM costs
+// ~135 us per call at N = 2 against ~30 us here.
+template <int NC>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const int lane = threadIdx.x % 64;
+    const uint32_t row = blockIdx.x * 4 + threadIdx.x / 64;
+    if (row >= ne1) {
+        return;
+    }
+
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+    const uint32_t n_half = n_blocks * 2;
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const int4 w = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        const float    dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+            const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+            int idot = 0;
+            idot = ggml_cuda_dp4a(w.x, a.x, idot); idot = ggml_cuda_dp4a(w.y, a.y, idot);
+            idot = ggml_cuda_dp4a(w.z, a.z, idot); idot = ggml_cuda_dp4a(w.w, a.w, idot);
+            acc[c] += dw * __low2float(xb->ds) * (float) idot;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<64>(acc[c]);
+        if (lane == 0) {
+            y[(size_t) c * ne1 + row] = v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
@@ -2909,6 +2962,24 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const int64_t x_stride, cudaStream_t stream) {
+    static const bool no_nc = getenv("GGML_CUDA_NO_Q8_NC") != nullptr;
+    if (!no_nc && src0->type == GGML_TYPE_Q8_0 && ne11 >= 2 && ne11 <= 8) {
+        const dim3 grid((ne01 + 3) / 4, 1, 1);
+        auto launch = [&](auto nc) {
+            constexpr int NC = decltype(nc)::value;
+            mul_mat_vec_q8_0_repacked_nc<NC><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+        };
+        switch (ne11) {
+            case 2:  launch(std::integral_constant<int, 2>{}); break;
+            case 3:  launch(std::integral_constant<int, 3>{}); break;
+            case 4:  launch(std::integral_constant<int, 4>{}); break;
+            case 5:  launch(std::integral_constant<int, 5>{}); break;
+            case 6:  launch(std::integral_constant<int, 6>{}); break;
+            case 7:  launch(std::integral_constant<int, 7>{}); break;
+            default: launch(std::integral_constant<int, 8>{}); break;
+        }
+        return;
+    }
     if (ne11 == 1) {
         // decode: dp4a matvec straight from the planes
         switch (src0->type) {
