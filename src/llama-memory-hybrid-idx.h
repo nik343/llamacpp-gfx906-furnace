@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -87,7 +88,30 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
+    // the set_input_qsa layout of one stream holding one sequence, kept between calls: decoding only fills
+    // empty cells, so the next call updates the few cells that changed instead of regrouping every cell
+    struct qsa_layout {
+        bool                  valid    = false;
+        const void          * cells    = nullptr;
+        int64_t               n_kv     = 0;
+        int64_t               n_blocks = 0;
+        int64_t               ratio    = 0;
+        std::vector<int32_t>  pos;       // [n_kv] cell positions the layout describes, -1 for empty
+        std::vector<int32_t>  cell_blk;  // [n_kv]
+        std::vector<int32_t>  blk_cells; // [ratio*n_blocks]
+        std::vector<int32_t>  blk_pos;   // [4*n_blocks]
+        std::vector<int32_t>  blk_of;    // [n_kv] block of each cell, -1 when it is in no full block
+        std::vector<uint64_t> grp_slots; // [n_blocks] filled slots of each position bucket
+        std::vector<int32_t>  grp_first; // [n_blocks] first cell seen in each bucket
+        std::vector<int32_t>  bid_idx;   // first position of each numbered block
+        std::vector<int32_t>  bid_cell;  // first cell of each numbered block
+        std::vector<int32_t>  unpooled;  // every cell with blk_of < 0
+        std::vector<int32_t>  added;     // scratch
+    };
+
 private:
+    mutable std::map<uint32_t, qsa_layout> qsa_layouts;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
