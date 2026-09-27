@@ -853,12 +853,262 @@ static __global__ void fattn_gather_rows(
 }
 
 static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// One query, f16 K/V, for the sparse-attention ops (n_kv_max hint): a block scores FATTN_DEC_C keys
+// against every query head of one KV head (lanes = keys, waves = slices of the heads), turns the scores
+// into chunk-local softmax weights and accumulates the V rows (threads = dims). fattn_dec_combine then
+// merges the chunks. Keys are read through idx (the finite mask columns) or are the cells themselves.
+static constexpr int FATTN_DEC_C     = 64;
+static constexpr int FATTN_DEC_MAX_C = 128; // chunks the combine kernel takes
+
+template <int D, int G>
+static __global__ void __launch_bounds__(256) fattn_dec_chunk(
+        const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask,
+        const int32_t * __restrict__ idx, const int n_keys, const float scale,
+        const int64_t q_sh, const int64_t nb11, const int64_t nb12, const int64_t nb21, const int64_t nb22,
+        float * __restrict__ part_o, float2 * __restrict__ part_ml) {
+    constexpr int C  = FATTN_DEC_C; // keys per block, one per lane
+    constexpr int DW = D/4;         // dims per wave in the scores
+
+    __shared__ float4 qs[G][D/4];
+    __shared__ float  sp[4][G][C];  // per-wave partial scores
+    __shared__ float4 ps[G][C/4];
+    __shared__ int    cells[C];
+
+    const int chunk = blockIdx.x;
+    const int g     = blockIdx.y;   // KV head
+    const int n_kvh = gridDim.y;
+    const int tid   = threadIdx.x;
+    const int lane  = tid % 64;
+    const int wave  = tid / 64;
+
+    for (int i = tid; i < G*D/4; i += blockDim.x) {
+        const int h  = i / (D/4);
+        const int d4 = i % (D/4);
+        const float4 q = ((const float4 *) (Q + (int64_t) (g*G + h)*q_sh))[d4];
+        qs[h][d4] = make_float4(q.x*scale, q.y*scale, q.z*scale, q.w*scale);
+    }
+    if (tid < C) {
+        const int j = chunk*C + tid;
+        cells[tid] = j < n_keys ? (idx ? idx[j] : j) : -1;
+    }
+    __syncthreads();
+
+    // partial scores: lane = key, wave = a quarter of the dims, all heads
+    {
+        const int cell = cells[lane];
+        float s[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            s[h] = 0.0f;
+        }
+        const int4 * kr = (const int4 *) (K + (int64_t) max(cell, 0)*nb11 + g*nb12) + wave*(DW/8);
+        int4 raw[DW/8];
+#pragma unroll
+        for (int c = 0; c < DW/8; ++c) {
+            raw[c] = kr[c];
+        }
+#pragma unroll
+        for (int c = 0; c < DW/8; ++c) {
+            const half2 * k2 = (const half2 *) &raw[c];
+            const float k0 = __low2float(k2[0]), k1 = __high2float(k2[0]);
+            const float k2f = __low2float(k2[1]), k3 = __high2float(k2[1]);
+            const float k4 = __low2float(k2[2]), k5 = __high2float(k2[2]);
+            const float k6 = __low2float(k2[3]), k7 = __high2float(k2[3]);
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float4 qa = qs[h][wave*(DW/4) + 2*c + 0];
+                const float4 qb = qs[h][wave*(DW/4) + 2*c + 1];
+                s[h] += qa.x*k0 + qa.y*k1 + qa.z*k2f + qa.w*k3 + qb.x*k4 + qb.y*k5 + qb.z*k6 + qb.w*k7;
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            sp[wave][h][lane] = s[h];
+        }
+    }
+    __syncthreads();
+
+    // chunk-local softmax: wave w takes heads w, w + 4, ..., lanes over the keys
+    for (int h = wave; h < G; h += 4) {
+        const int cell = cells[lane];
+        const float mk = cell >= 0 ? (mask ? __half2float(mask[cell]) : 0.0f) : -INFINITY;
+        const float v  = cell >= 0 ? ((sp[0][h][lane] + sp[1][h][lane]) + (sp[2][h][lane] + sp[3][h][lane])) + mk : -INFINITY;
+        const float m  = warp_reduce_max<64>(v);
+        const float p  = v == -INFINITY ? 0.0f : expf(v - m);
+        const float l  = warp_reduce_sum<64>(p);
+        ((float *) ps[h])[lane] = p;
+        if (lane == 0) {
+            part_ml[((int64_t) chunk*n_kvh + g)*G + h] = make_float2(m, l);
+        }
+    }
+    __syncthreads();
+
+    // values: thread = dim, 16 V loads in flight (a masked key reads row 0 and has weight 0)
+    for (int d = tid; d < D; d += blockDim.x) {
+        float o[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            o[h] = 0.0f;
+        }
+        for (int j0 = 0; j0 < C; j0 += 16) {
+            float v[16];
+#pragma unroll
+            for (int jj = 0; jj < 16; ++jj) {
+                const int cell = max(cells[j0 + jj], 0);
+                v[jj] = __half2float(((const half *) (V + (int64_t) cell*nb21 + g*nb22))[d]);
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+#pragma unroll
+                for (int q4 = 0; q4 < 4; ++q4) {
+                    const float4 w = ps[h][j0/4 + q4];
+                    o[h] += w.x*v[4*q4 + 0] + w.y*v[4*q4 + 1] + w.z*v[4*q4 + 2] + w.w*v[4*q4 + 3];
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            part_o[(((int64_t) chunk*n_kvh + g)*G + h)*D + d] = o[h];
+        }
+    }
+}
+
+// merge the chunks of one query head; chunks with nothing visible (l == 0) drop out
+template <int D>
+static __global__ void __launch_bounds__(256) fattn_dec_combine(
+        const float * __restrict__ part_o, const float2 * __restrict__ part_ml, float * __restrict__ dst,
+        const int n_chunks, const int G) {
+    __shared__ float fac[FATTN_DEC_MAX_C];
+    __shared__ float red[4];
+
+    const int hq    = blockIdx.x;   // query head
+    const int n_kvh = gridDim.x / G;
+    const int g     = hq / G;
+    const int h     = hq % G;
+    const int tid   = threadIdx.x;
+
+    float2 ml = make_float2(-INFINITY, 0.0f);
+    if (tid < n_chunks) {
+        ml = part_ml[((int64_t) tid*n_kvh + g)*G + h];
+    }
+    float m = ml.y > 0.0f ? ml.x : -INFINITY;
+    m = warp_reduce_max<64>(m);
+    if (tid % 64 == 0) {
+        red[tid / 64] = m;
+    }
+    __syncthreads();
+    const float m_all = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+    __syncthreads();
+
+    const float f = ml.y > 0.0f ? expf(ml.x - m_all) : 0.0f;
+    if (tid < n_chunks) {
+        fac[tid] = f;
+    }
+    float l = warp_reduce_sum<64>(ml.y * f);
+    if (tid % 64 == 0) {
+        red[tid / 64] = l;
+    }
+    __syncthreads();
+    const float l_all = (red[0] + red[1]) + (red[2] + red[3]);
+    const float inv_l = l_all > 0.0f ? 1.0f / l_all : 0.0f;
+
+    for (int d = tid; d < D; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int c = 0; c < n_chunks; ++c) {
+            acc += part_o[(((int64_t) c*n_kvh + g)*G + h)*D + d] * fac[c];
+        }
+        dst[(int64_t) hq*D + d] = acc * inv_l;
+    }
+}
+
+static bool ggml_cuda_flash_attn_ext_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_NO_FA_DEC") != nullptr || getenv("GGML_CUDA_NO_FA_GATHER") != nullptr;
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (disabled || mask == nullptr || n_kv_max <= 0 || dst->src[4] != nullptr) {
+        return false;
+    }
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int64_t D = K->ne[0];
+    const int     G = K->ne[2] > 0 ? (int) (Q->ne[2] / K->ne[2]) : 0;
+
+    if (Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            max_bias != 0.0f || logit_softcap != 0.0f || K->ne[2] != V->ne[2] || V->ne[0] != D || Q->ne[0] != D ||
+            (D != 128 && D != 256) || G*K->ne[2] != Q->ne[2] || (G != 8 && G != 12 && G != 16) ||
+            Q->nb[0] != sizeof(float) || Q->nb[2] % 16 != 0 || ((uintptr_t) Q->data) % 16 != 0 || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || mask->nb[0] != sizeof(half) ||
+            K->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || mask->ne[0] < K->ne[1]) {
+        return false;
+    }
+
+    const int64_t n_sel  = GGML_PAD((int64_t) n_kv_max, FATTN_KQ_STRIDE);
+    const bool    sparse = K->ne[1] >= 2*n_sel;
+    const int64_t n_keys = sparse ? n_sel : K->ne[1];
+    const int     n_ch   = (int) ((n_keys + FATTN_DEC_C - 1)/FATTN_DEC_C);
+    if (n_ch > FATTN_DEC_MAX_C) {
+        return false;
+    }
+
+    const int n_kvh = (int) K->ne[2];
+
+    ggml_cuda_pool & pool = ctx.pool();
+    cudaStream_t stream = ctx.stream();
+
+    const int n_cnt = (int) ((K->ne[1] + FATTN_GATHER_CHUNK - 1)/FATTN_GATHER_CHUNK);
+    ggml_cuda_pool_alloc<int32_t> idx(pool, sparse ? n_sel + n_cnt : 1);
+    if (sparse) {
+        int32_t * counts = idx.get() + n_sel;
+        fattn_gather_count<<<n_cnt, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts);
+        fattn_gather_compact<<<n_cnt, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel);
+    }
+
+    ggml_cuda_pool_alloc<float>  part_o (pool, (size_t) n_ch*n_kvh*G*D);
+    ggml_cuda_pool_alloc<float2> part_ml(pool, (size_t) n_ch*n_kvh*G);
+
+    auto launch = [&](auto d_c, auto g_c) {
+        constexpr int DT = decltype(d_c)::value;
+        constexpr int GT = decltype(g_c)::value;
+        fattn_dec_chunk<DT, GT><<<dim3(n_ch, n_kvh, 1), 256, 0, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,
+            sparse ? idx.get() : nullptr, (int) n_keys, scale,
+            Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], part_o.get(), part_ml.get());
+        fattn_dec_combine<DT><<<n_kvh*GT, 256, 0, stream>>>(part_o.get(), part_ml.get(), (float *) dst->data, n_ch, GT);
+    };
+    auto launch_g = [&](auto d_c) {
+        switch (G) {
+            case  8: launch(d_c, std::integral_constant<int,  8>{}); break;
+            case 12: launch(d_c, std::integral_constant<int, 12>{}); break;
+            default: launch(d_c, std::integral_constant<int, 16>{}); break;
+        }
+    };
+    if (D == 128) {
+        launch_g(std::integral_constant<int, 128>{});
+    } else {
+        launch_g(std::integral_constant<int, 256>{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 #endif // defined(GGML_USE_HIP)
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
-    if (ggml_cuda_flash_attn_ext_gather(ctx, dst)) {
+    if (ggml_cuda_flash_attn_ext_decode(ctx, dst) || ggml_cuda_flash_attn_ext_gather(ctx, dst)) {
         return;
     }
 #endif // defined(GGML_USE_HIP)
