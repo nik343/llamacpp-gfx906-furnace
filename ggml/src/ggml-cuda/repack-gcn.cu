@@ -3256,6 +3256,18 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
 // compacts routing into expert-sorted assignment order; activations are
 // quantized once in natural column order and gathered per assignment
 // via ids_src1 inside the kernels; outputs scatter via ids_dst.
+// small-batch MoE: give every (token, expert) slot its own copy of the token's q8_1 activation column
+static __global__ void repack_expand_x_slots(const block_q8_1 * __restrict__ xq, block_q8_1 * __restrict__ xe,
+        const int x_stride, const int n_used) {
+    const int a = blockIdx.x;
+    const int * src = (const int *) (xq + (int64_t) (a / n_used) * x_stride);
+    int       * dst = (int       *) (xe + (int64_t) a * x_stride);
+    const int n = x_stride * (int) (sizeof(block_q8_1) / sizeof(int));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst) {
@@ -3290,6 +3302,12 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const size_t  xq_bytes    = src1->ne[2] * src1->ne[1] * ne10_padded * sizeof(block_q8_1) / QK8_1;
     const int     si1         = ids->nb[1] / sizeof(int32_t);
     const int     sis1        = src1->nb[2] / src1->nb[1];
+
+    // a few tokens (speculative verify): run the per-slot decode kernels over all n_tokens*n_used slots
+    // instead of the routed tile GEMM, whose fixed cost dominates at this size
+    static const bool no_small = getenv("GGML_CUDA_NO_MOE_SMALL") != nullptr;
+    const bool small = !no_small && n_tokens > 1 && n_tokens <= 8 &&
+        (src1->ne[1] == 1 || (src1->ne[1] == n_expert_used && sis1 == n_expert_used));
 
     // batch: grouped tile GEMM, thin 16-token tiles (MoE routing spreads
     // tokens across experts; a 64-wide tile would be mostly empty)
@@ -3327,7 +3345,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     };
 
     bool capturing = false;
-    const bool use_rc = n_tokens > 1 && repack_route_cache_usable(ctx, stream, &capturing);
+    const bool use_rc = n_tokens > 1 && !small && repack_route_cache_usable(ctx, stream, &capturing);
     ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
 
     if (n_tokens > 1 && use_rc) {
@@ -3396,7 +3414,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             quantize_x(p_xq);
         }
     } else {
-        if (n_tokens > 1) {
+        if (n_tokens > 1 && !small) {
             p_ids_src1    = ids_src1.alloc(n_assign);
             p_ids_dst     = ids_dst.alloc(n_assign);
             p_bounds      = expert_bounds.alloc(ne02 + 1);
@@ -3407,72 +3425,89 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         // quantize all activation columns once, natural order
         p_xq = (char *) repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
     }
+    // the slot kernels read ids as one flat row of n_tokens*n_used; ids is usually a view of the
+    // full per-token expert ranking, so compact it
+    const int32_t * ids_d = (const int32_t *) ids->data;
+    ggml_cuda_pool_alloc<int32_t> ids_flat(ctx.pool());
+    if (small && si1 != n_expert_used) {
+        ids_flat.alloc(n_assign);
+        CUDA_CHECK(cudaMemcpy2DAsync(ids_flat.get(), n_expert_used * sizeof(int32_t), ids->data, ids->nb[1],
+            n_expert_used * sizeof(int32_t), n_tokens, cudaMemcpyDeviceToDevice, stream));
+        ids_d = ids_flat.get();
+    }
+    ggml_cuda_pool_alloc<block_q8_1> x_slots(ctx.pool());
+    if (small && src1->ne[1] == 1) {
+        x_slots.alloc(n_assign * x_stride);
+        repack_expand_x_slots<<<n_assign, 256, 0, stream>>>((const block_q8_1 *) p_xq, x_slots.get(), (int) x_stride, (int) n_expert_used);
+        p_xq = (char *) x_slots.get();
+    }
     const block_q8_1 * xq = (const block_q8_1 *) p_xq;
 
-    if (n_tokens == 1) {
+    if (n_tokens == 1 || small) {
         // decode: one matvec per slot; experts read directly from the
         // raw ids tensor in-kernel (no compaction kernels — launch
         // parity with canonical mmvq-id). Broadcast src1 (ne[1]==1, one
-        // shared activation column for all slots) uses x-stride 0.
-        const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
+        // shared activation column for all slots) uses x-stride 0; a few
+        // tokens have one expanded column per slot.
+        const uint32_t xs_eff = src1->ne[1] == 1 && !small ? 0u : (uint32_t) x_stride;
         switch (src0->type) {
             case GGML_TYPE_Q3_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q3k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
+                    ids_d, nullptr, nullptr,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q4_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q4k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
+                    ids_d, nullptr, nullptr,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q5k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
+                    ids_d, nullptr, nullptr,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q6_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q6k_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
+                    ids_d, nullptr, nullptr,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q5_1: {
                 if (ne00 <= 1024) {
                     launch_mul_mat_vec_q5_1_repacked_seg<true>(w, xq, dst_d, ne00, ne01, n_assign,
-                        (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1, stream);
+                        ids_d, expert_stride, xs_eff, dst_s1, stream);
                     break;
                 }
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q5_1_repacked<true><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nullptr, nullptr,
+                    ids_d, nullptr, nullptr,
                     (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
             } break;
             case GGML_TYPE_Q8_0: {
                 if (ne00 <= 1024) {
                     launch_mul_mat_vec_q8_0_repacked_seg<true>(w, xq, dst_d, ne00, ne01, n_assign,
-                        (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1, stream);
+                        ids_d, expert_stride, xs_eff, dst_s1, stream);
                     break;
                 }
                 if (ne01 >= 4096) {
                     const dim3 grid(ne01, n_assign, 1);
                     mul_mat_vec_q8_0_repacked<1, 1, true><<<grid, 64, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        (const int32_t *) ids->data, nullptr, nullptr,
+                        ids_d, nullptr, nullptr,
                         (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
                 } else {
                     const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                     mul_mat_vec_q8_0_repacked<2, 4, true><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                        (const int32_t *) ids->data, nullptr, nullptr,
+                        ids_d, nullptr, nullptr,
                         (uint32_t) ne02, expert_stride, xs_eff, dst_s1);
                 }
             } break;
