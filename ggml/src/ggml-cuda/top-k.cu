@@ -118,23 +118,43 @@ static __global__ void top_k_radix_select(
     const int tid = threadIdx.x;
     __shared__ int histogram[NBINS];
 
-    int count = 0;
-    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
-        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
-        count += block_histograms[offset + tid];
+    // independent partial sums keep several histogram loads in flight
+    const int * hrow = block_histograms + (size_t) row * blocks_per_row * NBINS + tid;
+    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    int row_block = 0;
+    for (; row_block + 4 <= blocks_per_row; row_block += 4) {
+        c0 += hrow[(row_block + 0) * NBINS];
+        c1 += hrow[(row_block + 1) * NBINS];
+        c2 += hrow[(row_block + 2) * NBINS];
+        c3 += hrow[(row_block + 3) * NBINS];
     }
+    for (; row_block < blocks_per_row; ++row_block) {
+        c0 += hrow[row_block * NBINS];
+    }
+    const int count = (c0 + c1) + (c2 + c3);
     histogram[tid] = count;
     __syncthreads();
 
-    if (tid == 0) {
-        top_k_radix_state state = states[row];
-        int bin = NBINS - 1;
-        while (bin > 0 && histogram[bin] < state.rank) {
-            state.rank -= histogram[bin--];
-        }
-        state.prefix |= (uint32_t) bin << shift;
-        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
-        states[row] = state;
+    // suffix sums over the bins, so the selected bin is found in parallel instead of by a serial scan:
+    // it is the highest bin whose suffix reaches the rank (bin 0 if none does)
+    static_assert(NBINS == BLOCK_SIZE, "one thread per bin");
+    const top_k_radix_state state = states[row];
+    for (int off = 1; off < NBINS; off *= 2) {
+        const int add = tid + off < NBINS ? histogram[tid + off] : 0;
+        __syncthreads();
+        histogram[tid] += add;
+        __syncthreads();
+    }
+
+    const int  above   = tid + 1 < NBINS ? histogram[tid + 1] : 0;
+    const bool reach   = histogram[tid] >= state.rank;
+    const bool reach_1 = above >= state.rank;
+    if ((reach && !reach_1) || (tid == 0 && !reach)) {
+        top_k_radix_state st = state;
+        st.rank        -= above;
+        st.prefix      |= (uint32_t) tid << shift;
+        st.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+        states[row] = st;
     }
 }
 
