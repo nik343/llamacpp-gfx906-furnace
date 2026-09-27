@@ -740,8 +740,128 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+#if defined(GGML_USE_HIP)
+// sparse decode without an index-aware kernel: list the finite mask columns, gather those K/V rows
+// and mask values into dense buffers, then attend over n_sel keys instead of the whole cache
+// list the finite mask columns in ascending order: blocks of 256 threads x 8 columns count theirs, then
+// each block writes its columns after the counts of the blocks before it
+static constexpr int FATTN_GATHER_CHUNK = 256*8;
+
+static __device__ __forceinline__ int fattn_gather_flags(const half * mask, const int n_kv, const int c0) {
+    int flags = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int i = c0 + k;
+        flags |= (i < n_kv && !isinf(__half2float(mask[i]))) << k;
+    }
+    return flags;
+}
+
+// exclusive prefix of v over the block, and the block total
+static __device__ __forceinline__ int fattn_gather_scan(const int v, int & total, int * wsum) {
+    const int lane = threadIdx.x % 64;
+    const int w    = threadIdx.x / 64;
+    int incl = v;
+#pragma unroll
+    for (int off = 1; off < 64; off *= 2) {
+        const int t = __shfl_up(incl, off, 64);
+        incl += lane >= off ? t : 0;
+    }
+    if (lane == 63) {
+        wsum[w] = incl;
+    }
+    __syncthreads();
+    int base = 0;
+    total = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        base  += k < w ? wsum[k] : 0;
+        total += wsum[k];
+    }
+    return base + incl - v;
+}
+
+static __global__ void __launch_bounds__(256) fattn_gather_count(const half * __restrict__ mask, const int n_kv, int * __restrict__ counts) {
+    __shared__ int wsum[4];
+    const int flags = fattn_gather_flags(mask, n_kv, blockIdx.x*FATTN_GATHER_CHUNK + threadIdx.x*8);
+    int total;
+    fattn_gather_scan(__popc(flags), total, wsum);
+    if (threadIdx.x == 0) {
+        counts[blockIdx.x] = total;
+    }
+}
+
+static __global__ void __launch_bounds__(256) fattn_gather_compact(
+        const half * __restrict__ mask, const int n_kv, const int * __restrict__ counts, int32_t * __restrict__ idx, const int n_sel) {
+    __shared__ int wsum[4];
+    int before = 0;
+    int all    = 0;
+    for (int k = 0; k < (int) gridDim.x; ++k) {
+        const int n = counts[k];
+        before += k < (int) blockIdx.x ? n : 0;
+        all    += n;
+    }
+
+    const int c0    = blockIdx.x*FATTN_GATHER_CHUNK + threadIdx.x*8;
+    const int flags = fattn_gather_flags(mask, n_kv, c0);
+    int total;
+    int dst = before + fattn_gather_scan(__popc(flags), total, wsum);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if ((flags >> k) & 1) {
+            if (dst < n_sel) {
+                idx[dst] = c0 + k;
+            }
+            dst++;
+        }
+    }
+
+    for (int j = min(all, n_sel) + blockIdx.x*256 + threadIdx.x; j < n_sel; j += gridDim.x*256) {
+        idx[j] = -1;
+    }
+}
+
+// one wave per selected column: the K and V rows of every head, plus the mask value of every mask row
+static __global__ void fattn_gather_rows(
+        const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask, const int32_t * __restrict__ idx,
+        char * __restrict__ Kg, char * __restrict__ Vg, half * __restrict__ maskg,
+        const int n_head, const int row_k, const int row_v,
+        const int64_t nb11, const int64_t nb12, const int64_t nb21, const int64_t nb22,
+        const int64_t s31, const int n_mask_rows, const int n_sel) {
+    const int lane = threadIdx.x % 64;
+    const int j    = blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
+    if (j >= n_sel) {
+        return;
+    }
+    const int c = idx[j];
+
+    const int nk = row_k/16;
+    const int nv = row_v/16;
+    for (int t = lane; t < n_head*(nk + nv); t += 64) {
+        const int  h    = t / (nk + nv);
+        const int  o    = t % (nk + nv);
+        const bool is_k = o < nk;
+        const int  q    = is_k ? o : o - nk;
+
+        int4 * d = (int4 *) (is_k ? Kg + ((int64_t) j*n_head + h)*row_k : Vg + ((int64_t) j*n_head + h)*row_v);
+        const int4 * sp = (const int4 *) (is_k ? K + (int64_t) c*nb11 + h*nb12 : V + (int64_t) c*nb21 + h*nb22);
+        d[q] = c >= 0 ? sp[q] : make_int4(0, 0, 0, 0);
+    }
+    for (int q = lane; q < n_mask_rows; q += 64) {
+        maskg[(int64_t) q*n_sel + j] = c >= 0 ? mask[q*s31 + c] : __float2half(-INFINITY);
+    }
+}
+
+static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_gather(ctx, dst)) {
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -760,3 +880,103 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+#if defined(GGML_USE_HIP)
+static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool disabled = getenv("GGML_CUDA_NO_FA_GATHER") != nullptr;
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (disabled || mask == nullptr || n_kv_max <= 0) {
+        return false;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int64_t n_sel = GGML_PAD((int64_t) n_kv_max, FATTN_KQ_STRIDE);
+
+    // one query per sequence: its visible columns are exactly the finite mask entries of row 0
+    if (Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
+            max_bias != 0.0f || logit_softcap != 0.0f || K->ne[2] != V->ne[2] ||
+            K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || mask->nb[0] != sizeof(half) ||
+            (K->ne[0]*sizeof(half)) % 16 != 0 || (V->ne[0]*sizeof(half)) % 16 != 0 ||
+            K->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || V->nb[1] % 16 != 0 || V->nb[2] % 16 != 0 ||
+            K->ne[1] < 2*n_sel || mask->ne[0] < K->ne[1]) {
+        return false;
+    }
+
+    const int n_head = (int) K->ne[2];
+    const int row_k  = (int) (K->ne[0]*sizeof(half));
+    const int row_v  = (int) (V->ne[0]*sizeof(half));
+    const int n_mrow = (int) mask->ne[1];
+
+    ggml_cuda_pool & pool = ctx.pool();
+    const int n_chunks = (int) ((K->ne[1] + FATTN_GATHER_CHUNK - 1)/FATTN_GATHER_CHUNK);
+
+    ggml_cuda_pool_alloc<int32_t> idx(pool, n_sel + n_chunks);
+    ggml_cuda_pool_alloc<char>    Kg(pool, n_sel*n_head*row_k);
+    ggml_cuda_pool_alloc<char>    Vg(pool, n_sel*n_head*row_v);
+    ggml_cuda_pool_alloc<half>    maskg(pool, n_sel*n_mrow);
+
+    cudaStream_t stream = ctx.stream();
+
+    int32_t * counts = idx.get() + n_sel;
+    fattn_gather_count<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts);
+    fattn_gather_compact<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel);
+    fattn_gather_rows<<<(n_sel + 3)/4, 256, 0, stream>>>((const char *) K->data, (const char *) V->data, (const half *) mask->data, idx.get(),
+        Kg.get(), Vg.get(), maskg.get(), n_head, row_k, row_v, K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+        mask->nb[1]/sizeof(half), n_mrow, (int) n_sel);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_tensor Kt = *K;
+    ggml_tensor Vt = *V;
+    ggml_tensor Mt = *mask;
+
+    Kt.data  = Kg.get();
+    Kt.ne[1] = n_sel;
+    Kt.nb[1] = (size_t) n_head*row_k;
+    Kt.nb[2] = row_k;
+    Kt.nb[3] = Kt.nb[1]*n_sel;
+
+    Vt.data  = Vg.get();
+    Vt.ne[1] = n_sel;
+    Vt.nb[1] = (size_t) n_head*row_v;
+    Vt.nb[2] = row_v;
+    Vt.nb[3] = Vt.nb[1]*n_sel;
+
+    Mt.data  = maskg.get();
+    Mt.ne[0] = n_sel;
+    Mt.nb[1] = n_sel*sizeof(half);
+    Mt.nb[2] = Mt.nb[1]*n_mrow;
+    Mt.nb[3] = Mt.nb[2];
+
+    ggml_tensor d = *dst;
+    d.src[1] = &Kt;
+    d.src[2] = &Vt;
+    d.src[3] = &Mt;
+    ggml_set_op_params_i32(&d, 4, 0);
+
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), &d)) {
+        case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_flash_attn_ext_tile(ctx, &d);
+            return true;
+        case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_flash_attn_ext_vec(ctx, &d);
+            return true;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, &d);
+            return true;
+        case BEST_FATTN_KERNEL_NONE:
+            break;
+    }
+    GGML_ABORT("fatal error");
+}
+#endif // defined(GGML_USE_HIP)
