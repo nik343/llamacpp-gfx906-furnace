@@ -2822,6 +2822,164 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 };
 
+// qwen4exp QSA indexer key pooling: GET_ROWS -> row views summed -> SCALE -> RMS_NORM -> MUL -> ROPE (multi)
+struct test_qsa_pool : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t r;
+    const int64_t n_stream;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_POOL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_kv, r, n_stream, mode);
+    }
+
+    test_qsa_pool(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 512, int64_t r = 4, int64_t n_stream = 1,
+            int mode = GGML_ROPE_TYPE_IMROPE)
+        : type(type), n_kv(n_kv), r(r), n_stream(n_stream), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d        = 128;
+        const int64_t n_blocks = (n_kv + r - 1)/r;
+
+        ggml_tensor * k   = ggml_new_tensor_3d(ctx, type, d, n_kv, n_stream);
+        ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r*n_blocks, n_stream);
+        ggml_tensor * w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * members = ggml_get_rows(ctx, k, idx);
+        members = ggml_reshape_4d(ctx, members, d, r, n_blocks, n_stream);
+
+        ggml_tensor * pooled = nullptr;
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_view_3d(ctx, members, d, n_blocks, n_stream, members->nb[2], members->nb[3], i*members->nb[1]);
+            pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx, pooled, 1.0f/(float) r);
+        pooled = ggml_reshape_3d(ctx, pooled, d, n_blocks*n_stream, 1);
+        pooled = ggml_rms_norm(ctx, pooled, 1e-6f);
+        pooled = ggml_mul(ctx, pooled, w);
+        pooled = ggml_reshape_3d(ctx, pooled, d, 1, n_blocks*n_stream);
+
+        int sections[4] = { 11, 11, 10, 0 };
+        pooled = ggml_rope_multi(ctx, pooled, pos, nullptr, 64, sections, mode, 0, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+
+        ggml_set_name(pooled, "out");
+        return pooled;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                const int32_t lim = strcmp(t->name, "pos") == 0 ? 40000 : (int32_t) n_kv;
+                for (int32_t & value : data) {
+                    value = rand() % lim;
+                }
+                // at long context, lay the members out as a cache does: block b holds cells b*r .. b*r + r - 1
+                if (strcmp(t->name, "pos") != 0 && n_kv > 16384) {
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        data[i] = (int32_t) (i % (size_t) n_kv);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// qwen4exp QSA indexer scores for one query: MUL_MAT -> RELU -> head sum -> bias -> expand to cells -> + mask
+struct test_qsa_score : public test_case {
+    const int64_t n_kv;
+    const int64_t r;
+    const int64_t n_head;
+    const ggml_type mask_type;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SCORE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_kv, r, n_head, mask_type);
+    }
+
+    test_qsa_score(int64_t n_kv = 512, int64_t r = 4, int64_t n_head = 4, ggml_type mask_type = GGML_TYPE_F16)
+        : n_kv(n_kv), r(r), n_head(n_head), mask_type(mask_type) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t d        = 128;
+        const int64_t n_blocks = (n_kv + r - 1)/r;
+
+        ggml_tensor * keys     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_blocks);
+        ggml_tensor * q        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, n_head, 1);
+        ggml_tensor * bias     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 1, 1);
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, 1);
+        ggml_tensor * mask     = ggml_new_tensor_4d(ctx, mask_type, n_kv, 1, 1, 1);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * score = ggml_mul_mat(ctx, keys, q);
+        score = ggml_reshape_4d(ctx, score, n_blocks, n_head, 1, 1);
+        score = ggml_relu(ctx, score);
+
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_head; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, score, n_blocks, 1, 1, score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        score = ggml_add(ctx, summed, bias);
+
+        ggml_tensor * expanded = ggml_get_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3)), cell_blk);
+        expanded = ggml_cont(ctx, ggml_permute(ctx, expanded, 1, 0, 2, 3));
+
+        ggml_tensor * m = mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx, mask, GGML_TYPE_F32);
+        expanded = ggml_add(ctx, expanded, ggml_reshape_3d(ctx, m, n_kv, 1, 1));
+
+        ggml_set_name(expanded, "out");
+        return expanded;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_blocks = (n_kv + r - 1)/r;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cell_blk") == 0) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    data[c] = (int32_t) (c % 11 == 0 ? rand() % n_blocks : c / r);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    data[c] = c % 7 == 3 ? -1000.0f : 0.0f;
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> h(data.size());
+                    ggml_fp32_to_fp16_row(data.data(), h.data(), h.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_ARGMAX
 struct test_argmax : public test_case {
     const ggml_type type;
@@ -9858,6 +10016,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_kv : { 7, 512, 8448, 33024 }) {
+            test_cases.emplace_back(new test_qsa_pool(type, n_kv, 4, 1, GGML_ROPE_TYPE_IMROPE));
+        }
+        test_cases.emplace_back(new test_qsa_pool(type, 512, 4, 2, GGML_ROPE_TYPE_IMROPE));
+        test_cases.emplace_back(new test_qsa_pool(type, 512, 2, 1, GGML_ROPE_TYPE_MROPE));
+    }
+
+    for (int64_t n_kv : { 8, 512, 8448, 33024 }) {
+        test_cases.emplace_back(new test_qsa_score(n_kv, 4, 4, GGML_TYPE_F16));
+    }
+    test_cases.emplace_back(new test_qsa_score(512, 4, 2, GGML_TYPE_F32));
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));

@@ -939,3 +939,337 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+// QSA indexer key pooling: gather r member rows per block, mean, rms_norm * w, mrope
+// half a wave per pooled row (two rows per wave), D = 128 channels, 4 per lane. the arithmetic matches
+// get_rows -> add -> scale -> rms_norm_f32<256> -> mul -> rope_multi exactly: rms_norm_f32 sums each half
+// of the row with a 64-lane butterfly, which is a balanced tree in channel order, rebuilt here from the
+// in-lane pairs up
+template <typename T> struct qsa_quad;
+template <> struct qsa_quad<half>  { using type = uint2;  };
+template <> struct qsa_quad<float> { using type = float4; };
+
+static __device__ __forceinline__ void qsa_quad_load(const uint2 q, float v[4]) {
+    const half2 lo = *reinterpret_cast<const half2 *>(&q.x);
+    const half2 hi = *reinterpret_cast<const half2 *>(&q.y);
+    v[0] = __low2float(lo); v[1] = __high2float(lo);
+    v[2] = __low2float(hi); v[3] = __high2float(hi);
+}
+
+static __device__ __forceinline__ void qsa_quad_load(const float4 q, float v[4]) {
+    v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
+}
+
+// R > 0 fixes the member count at compile time so all member rows load at once; R == 0 reads r
+template <typename T, int R>
+static __global__ void __launch_bounds__(256) qsa_pool_norm_rope_f32(
+        const T * __restrict__ src, const int32_t * __restrict__ idx, const float * __restrict__ w,
+        const int32_t * __restrict__ pos, float * __restrict__ dst,
+        const int r, const int n_blocks, const int n_rows, const int64_t nb1, const int64_t nb2, const int64_t s_idx,
+        const float scale, const float bias, const float eps,
+        const int n_dims, const float theta_scale, const float freq_scale, const float ext_factor,
+        const float attn_factor, const rope_corr_dims corr_dims, const mrope_sections sections, const bool is_imrope) {
+    constexpr int D = 128;
+    using quad_t = typename qsa_quad<T>::type;
+
+    __shared__ float xs[8][D];
+    __shared__ float cs[8][D/2];
+    __shared__ float sn[8][D/2];
+
+    const int slot  = threadIdx.x / 32;      // row slot in the block
+    const int l     = threadIdx.x % 32;      // lane in the half wave
+    const int hbase = threadIdx.x % 64 - l;  // first lane of this half in the wave
+
+    const int half_dims = n_dims/2;
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w     = sections.v[1] + sections.v[0];
+
+    // rotated pair c = l: its frequency and which position row it reads do not depend on the row
+    const int   c      = l;
+    const float pw     = powf(theta_scale, (2*c) / 2.0f);
+    const int   sector = c % sect_dims;
+    int psel = 3;
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
+            psel = 1;
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
+            psel = 2;
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
+            psel = 0;
+        }
+    } else {
+        if (sector < sections.v[0]) {
+            psel = 0;
+        } else if (sector < sec_w) {
+            psel = 1;
+        } else if (sector < sec_w + sections.v[2]) {
+            psel = 2;
+        }
+    }
+
+    float wl[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        wl[k] = w[4*l + k];
+    }
+
+    for (int base = blockIdx.x*8; base < n_rows; base += gridDim.x*8) {
+        const int  row = base + slot;
+        const bool ok  = row < n_rows;
+        const int  rc  = ok ? row : n_rows - 1; // past the end, load a valid row and discard it
+
+        // no branch around the loads, so the position and member index loads overlap
+        const int s  = rc / n_blocks;
+        const int bk = rc % n_blocks;
+        const int pos_v   = pos[rc + n_rows*psel];
+        const int my_cell = idx[s*s_idx + (int64_t) bk*r + min(l, r - 1)];
+
+        float v[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        {
+            const char * sbase = (const char *) src + s*nb2;
+
+            if constexpr (R > 0) {
+                quad_t q[R];
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    const int cell = __shfl(my_cell, hbase + i, 64);
+                    q[i] = ((const quad_t *) (sbase + (int64_t) cell*nb1))[l];
+                }
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    float m[4];
+                    qsa_quad_load(q[i], m);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        v[k] = i == 0 ? m[k] : v[k] + m[k];
+                    }
+                }
+            } else {
+                for (int i = 0; i < r; ++i) {
+                    const int cell = __shfl(my_cell, hbase + i, 64);
+                    float m[4];
+                    qsa_quad_load(((const quad_t *) (sbase + (int64_t) cell*nb1))[l], m);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        v[k] = i == 0 ? m[k] : v[k] + m[k];
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                v[k] = scale*v[k] + bias;
+            }
+        }
+
+        // butterfly levels 1-2 inside the lane, 3-6 across the 16 lanes of each half row.
+        // rms_norm rounds each square before adding, so keep these from contracting into fma
+        float t = (__fmul_rn(v[0], v[0]) + __fmul_rn(v[1], v[1])) + (__fmul_rn(v[2], v[2]) + __fmul_rn(v[3], v[3]));
+        t += __shfl_xor(t, 1, 64);
+        t += __shfl_xor(t, 2, 64);
+        t += __shfl_xor(t, 4, 64);
+        t += __shfl_xor(t, 8, 64);
+        const float sum = __shfl(t, hbase, 64) + __shfl(t, hbase + 16, 64);
+        const float rs  = rsqrtf(sum/D + eps);
+
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            xs[slot][4*l + k] = rs*v[k]*wl[k];
+        }
+
+        if (ok && c < half_dims) {
+            const float theta_base = pos_v * pw;
+
+            float cos_theta;
+            float sin_theta;
+            rope_yarn<true>(theta_base, freq_scale, corr_dims, 2*c, ext_factor, attn_factor, cos_theta, sin_theta);
+
+            cs[slot][c] = cos_theta;
+            sn[slot][c] = sin_theta;
+        }
+        __syncthreads();
+
+        if (ok) {
+            float out[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int e = 4*l + k;
+                if (e >= n_dims) {
+                    out[k] = xs[slot][e];
+                } else {
+                    const int   ce = e % half_dims;
+                    const float x0 = xs[slot][ce];
+                    const float x1 = xs[slot][ce + half_dims];
+                    out[k] = e < half_dims ? x0*cs[slot][ce] - x1*sn[slot][ce] : x0*sn[slot][ce] + x1*cs[slot][ce];
+                }
+            }
+            *(float4 *) (dst + (int64_t) row*D + 4*l) = make_float4(out[0], out[1], out[2], out[3]);
+        }
+        __syncthreads();
+    }
+}
+
+bool ggml_cuda_qsa_pool_ok(const ggml_tensor * get_rows, const ggml_tensor * scale, const ggml_tensor * rms_norm,
+        const ggml_tensor * mul, const ggml_tensor * rope) {
+    const ggml_tensor * k   = get_rows->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    const ggml_tensor * w   = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+
+    const size_t pair = 4*ggml_type_size(k->type);
+
+    return (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) && k->ne[0] == 128 && k->nb[0] == ggml_type_size(k->type) &&
+        k->nb[1] % pair == 0 && k->nb[2] % pair == 0 && ((uintptr_t) k->data) % pair == 0 &&
+        k->ne[3] == 1 && idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx) && idx->ne[2] == 1 && idx->ne[3] == 1 &&
+        idx->ne[1] == k->ne[2] && w->type == GGML_TYPE_F32 && ggml_nelements(w) == 128 && ggml_is_contiguous(w) &&
+        rope->type == GGML_TYPE_F32 && ggml_is_contiguous(rope) && rope->ne[0] == 128 && rope->ne[1] == 1 &&
+        rope->src[2] == nullptr && (mode & GGML_ROPE_TYPE_MROPE) && mode != GGML_ROPE_TYPE_VISION &&
+        n_offs == 0 && n_dims > 0 && n_dims <= 128 && n_dims % 2 == 0 &&
+        ggml_nelements(scale) == ggml_nelements(rope) && ggml_nelements(rms_norm) == ggml_nelements(rope);
+}
+
+void ggml_cuda_op_qsa_pool_norm_rope(ggml_backend_cuda_context & ctx, const ggml_tensor * get_rows, int r,
+        const ggml_tensor * scale, const ggml_tensor * rms_norm, const ggml_tensor * mul, ggml_tensor * rope) {
+    const ggml_tensor * k   = get_rows->src[0];
+    const ggml_tensor * idx = get_rows->src[1];
+    const ggml_tensor * w   = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float sc;
+    float sb;
+    float eps;
+    memcpy(&sc,  (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&sb,  (const float *) scale->op_params + 1, sizeof(float));
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    mrope_sections sections;
+
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+
+    const int n_stream = (int) k->ne[2];
+    const int n_blocks = (int) (idx->ne[0] / r);
+    const int n_rows   = n_blocks*n_stream;
+    GGML_ASSERT(rope->ne[2] == n_rows);
+
+    const int64_t s_idx = idx->nb[1] / sizeof(int32_t);
+
+    const dim3 grid(std::min((n_rows + 7)/8, 4096), 1, 1);
+    const dim3 block(256, 1, 1);
+    cudaStream_t stream = ctx.stream();
+
+    const bool imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    auto launch = [&](auto type_tag, auto r_c) {
+        using T = decltype(type_tag);
+        constexpr int R = decltype(r_c)::value;
+        qsa_pool_norm_rope_f32<T, R><<<grid, block, 0, stream>>>((const T *) k->data, (const int32_t *) idx->data,
+            (const float *) w->data, (const int32_t *) rope->src[1]->data, (float *) rope->data,
+            r, n_blocks, n_rows, k->nb[1], k->nb[2], s_idx, sc, sb, eps,
+            n_dims, theta_scale, freq_scale, ext_factor, attn_factor, corr_dims, sections, imrope);
+    };
+    auto launch_r = [&](auto type_tag) {
+        switch (r) {
+            case 2:  launch(type_tag, std::integral_constant<int, 2>{}); break;
+            case 4:  launch(type_tag, std::integral_constant<int, 4>{}); break;
+            case 8:  launch(type_tag, std::integral_constant<int, 8>{}); break;
+            default: launch(type_tag, std::integral_constant<int, 0>{}); break;
+        }
+    };
+    if (k->type == GGML_TYPE_F16) {
+        launch_r(half());
+    } else {
+        launch_r(float());
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// QSA indexer block scores for one query: relu(k_b . q_h) summed over heads, plus the block bias
+// one wave per block; D = 128 channels, 2 per lane
+template <int H>
+static __global__ void qsa_score_blocks_f32(
+        const float * __restrict__ keys, const float * __restrict__ q, const float * __restrict__ bias,
+        float * __restrict__ score, const int n_blocks, const int64_t s_key, const int64_t s_q) {
+    const int lane = threadIdx.x % 64;
+    const int b    = blockIdx.x*(blockDim.x/64) + threadIdx.x/64;
+    if (b >= n_blocks) {
+        return;
+    }
+
+    // same pairing and order as mul_mat_vec_f: adjacent channels per lane, then a wave sum
+    const float2 k = ((const float2 *) (keys + b*s_key))[lane];
+
+    float total = 0.0f;
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+        const float2 qh = ((const float2 *) (q + h*s_q))[lane];
+        float d = 0.0f;
+        ggml_cuda_mad(d, k.x, qh.x);
+        ggml_cuda_mad(d, k.y, qh.y);
+        d = fmaxf(warp_reduce_sum<64>(d), 0);
+        total = h == 0 ? d : total + d;
+    }
+    if (lane == 0) {
+        score[b] = total + bias[b];
+    }
+}
+
+template <typename mask_t>
+static __global__ void qsa_score_expand_f32(
+        const float * __restrict__ score, const int32_t * __restrict__ cell_blk, const mask_t * __restrict__ mask,
+        float * __restrict__ dst, const int n_kv) {
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n_kv) {
+        return;
+    }
+    dst[c] = score[cell_blk[c]] + ggml_cuda_cast<float>(mask[c]);
+}
+
+void ggml_cuda_op_qsa_score(ggml_backend_cuda_context & ctx, const ggml_tensor * keys, const ggml_tensor * q, int n_head,
+        const ggml_tensor * bias, const ggml_tensor * cell_blk, const ggml_tensor * mask, ggml_tensor * dst) {
+    const int n_blocks = (int) keys->ne[1];
+    const int n_kv     = (int) dst->ne[0];
+
+    ggml_cuda_pool_alloc<float> score(ctx.pool(), n_blocks);
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t s_key = keys->nb[1]/sizeof(float);
+    const int64_t s_q   = q->nb[1]/sizeof(float);
+
+    const dim3 grid_b((n_blocks + 3)/4, 1, 1);
+    switch (n_head) {
+        case 1: qsa_score_blocks_f32<1><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
+        case 2: qsa_score_blocks_f32<2><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
+        case 4: qsa_score_blocks_f32<4><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
+        case 8: qsa_score_blocks_f32<8><<<grid_b, 256, 0, stream>>>((const float *) keys->data, (const float *) q->data, (const float *) bias->data, score.get(), n_blocks, s_key, s_q); break;
+        default: GGML_ABORT("qsa_score: unsupported head count");
+    }
+
+    const dim3 grid_c((n_kv + 255)/256, 1, 1);
+    if (mask->type == GGML_TYPE_F16) {
+        qsa_score_expand_f32<half><<<grid_c, 256, 0, stream>>>(score.get(), (const int32_t *) cell_blk->data, (const half *) mask->data, (float *) dst->data, n_kv);
+    } else {
+        qsa_score_expand_f32<float><<<grid_c, 256, 0, stream>>>(score.get(), (const int32_t *) cell_blk->data, (const float *) mask->data, (float *) dst->data, n_kv);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

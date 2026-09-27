@@ -4051,6 +4051,213 @@ static bool ggml_cuda_fusion_inputs_ok(const ggml_tensor * dst, std::initializer
     return true;
 }
 
+// QSA indexer key pooling (qwen4exp build_qsa_top_k):
+//   GET_ROWS -> RESHAPE -> r row views summed left to right -> SCALE -> RESHAPE -> RMS_NORM -> MUL -> RESHAPE -> ROPE
+// every node in the window must belong to the chain, since the fused launch skips them all
+struct ggml_cuda_qsa_pool_match {
+    int r         = 0;
+    int n_nodes   = 0;
+    ggml_tensor * scale    = nullptr;
+    ggml_tensor * rms_norm = nullptr;
+    ggml_tensor * mul      = nullptr;
+    ggml_tensor * rope     = nullptr;
+};
+
+static bool ggml_cuda_match_qsa_pool(const ggml_cgraph * cgraph, int i, ggml_cuda_qsa_pool_match & m) {
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || gr->ne[0] != 128 || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    const ggml_tensor * mem = cgraph->nodes[i + 1];
+    if (mem->op != GGML_OP_RESHAPE || mem->src[0] != gr) {
+        return false;
+    }
+    const int r = (int) mem->ne[1];
+    if (r < 2 || r > 64 || ggml_node_get_use_count(cgraph, i + 1) != r) {
+        return false;
+    }
+
+    // left-leaning sum: view0, view1, add, view2, add, ...
+    int j = i + 2;
+    const ggml_tensor * acc = nullptr;
+    for (int k = 0; k < r; ++k) {
+        if (j >= cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * v = cgraph->nodes[j];
+        if (v->op != GGML_OP_VIEW || v->src[0] != mem || v->view_offs != (size_t) k*mem->nb[1] ||
+                v->ne[0] != 128 || v->ne[1] != mem->ne[2] || v->ne[2] != mem->ne[3] || ggml_node_get_use_count(cgraph, j) != 1) {
+            return false;
+        }
+        j++;
+        if (k == 0) {
+            acc = v;
+            continue;
+        }
+        if (j >= cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[j];
+        if (add->op != GGML_OP_ADD || add->src[0] != acc || add->src[1] != v || add->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(add) || !ggml_are_same_shape(add, v) || !ggml_node_has_n_uses(cgraph, j, 1)) {
+            return false;
+        }
+        acc = add;
+        j++;
+    }
+
+    const ggml_op tail[] = { GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ROPE };
+    ggml_tensor * t[6];
+    for (int k = 0; k < 6; ++k, ++j) {
+        if (j >= cgraph->n_nodes) {
+            return false;
+        }
+        t[k] = cgraph->nodes[j];
+        const ggml_tensor * prev = k == 0 ? acc : t[k - 1];
+        if (t[k]->op != tail[k] || (t[k]->src[0] != prev && t[k]->src[1] != prev) || !(t[k]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return false;
+        }
+        if (k < 5 && ggml_node_get_use_count(cgraph, j) != 1) {
+            return false;
+        }
+    }
+    if (t[3]->src[0] != t[2]) {
+        return false;
+    }
+
+    m.r        = r;
+    m.n_nodes  = j - i;
+    m.scale    = t[0];
+    m.rms_norm = t[2];
+    m.mul      = t[3];
+    m.rope     = t[5];
+    return ggml_cuda_qsa_pool_ok(gr, m.scale, m.rms_norm, m.mul, m.rope);
+}
+
+// QSA indexer scores for one query (qwen4exp build_qsa_top_k, per-block bias):
+//   MUL_MAT(keys, q) -> RESHAPE -> RELU -> head views summed -> ADD bias -> PERMUTE -> CONT -> GET_ROWS(cell_blk)
+//   -> PERMUTE -> CONT -> [CPY mask ->] RESHAPE mask -> ADD
+struct ggml_cuda_qsa_score_match {
+    int n_nodes = 0;
+    int n_head  = 0;
+    const ggml_tensor * keys     = nullptr;
+    const ggml_tensor * q        = nullptr;
+    const ggml_tensor * bias     = nullptr;
+    const ggml_tensor * cell_blk = nullptr;
+    const ggml_tensor * mask     = nullptr;
+    ggml_tensor *       cpy      = nullptr;
+    ggml_tensor *       dst      = nullptr;
+};
+
+static bool ggml_cuda_match_qsa_score(const ggml_cgraph * cgraph, int i, ggml_cuda_qsa_score_match & m) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    const ggml_tensor * keys = mm->src[0];
+    const ggml_tensor * q    = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || keys->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 ||
+            keys->ne[0] != 128 || q->ne[0] != 128 || keys->nb[0] != sizeof(float) || q->nb[0] != sizeof(float) ||
+            keys->ne[2] != 1 || keys->ne[3] != 1 || q->ne[2] != 1 || q->ne[3] != 1 || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    const int n_head = (int) q->ne[1];
+    if (n_head != 1 && n_head != 2 && n_head != 4 && n_head != 8) {
+        return false;
+    }
+
+    int j = i;
+    auto next = [&](ggml_op op, const ggml_tensor * src0, int uses) -> const ggml_tensor * {
+        if (++j >= cgraph->n_nodes) {
+            return nullptr;
+        }
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != op || (src0 != nullptr && t->src[0] != src0) || !(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return nullptr;
+        }
+        if (uses >= 0 && ggml_node_get_use_count(cgraph, j) != uses) {
+            return nullptr;
+        }
+        return t;
+    };
+
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    const ggml_tensor * rs = next(GGML_OP_RESHAPE, mm, 1);
+    if (!rs || rs->ne[0] != keys->ne[1] || rs->ne[1] != n_head || rs->ne[2] != 1 || rs->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * relu = next(GGML_OP_UNARY, rs, n_head);
+    if (!relu || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU) {
+        return false;
+    }
+    const ggml_tensor * acc = nullptr;
+    for (int h = 0; h < n_head; ++h) {
+        const ggml_tensor * v = next(GGML_OP_VIEW, relu, 1);
+        if (!v || v->view_offs != (size_t) h*relu->nb[1] || v->ne[0] != relu->ne[0] || ggml_nelements(v) != v->ne[0]) {
+            return false;
+        }
+        if (h == 0) {
+            acc = next(GGML_OP_CONT, v, 1);
+        } else {
+            const ggml_tensor * add = next(GGML_OP_ADD, acc, 1);
+            acc = add && add->src[1] == v ? add : nullptr;
+        }
+        if (!acc) {
+            return false;
+        }
+    }
+    const ggml_tensor * badd = next(GGML_OP_ADD, acc, 1);
+    if (!badd || badd->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(badd->src[1]) || !ggml_are_same_shape(badd, badd->src[1])) {
+        return false;
+    }
+    const ggml_tensor * p1 = next(GGML_OP_PERMUTE, badd, 1);
+    const ggml_tensor * c1 = p1 ? next(GGML_OP_CONT, p1, 1) : nullptr;
+    const ggml_tensor * gr = c1 ? next(GGML_OP_GET_ROWS, c1, 1) : nullptr;
+    const ggml_tensor * p2 = gr ? next(GGML_OP_PERMUTE, gr, 1) : nullptr;
+    const ggml_tensor * c2 = p2 ? next(GGML_OP_CONT, p2, 1) : nullptr;
+    if (!c2 || c1->ne[0] != 1 || gr->src[1]->type != GGML_TYPE_I32 || !ggml_is_contiguous(gr->src[1]) ||
+            gr->src[1]->ne[0] != c2->ne[0] || c2->ne[1] != 1 || c2->ne[2] != 1 || c2->ne[3] != 1) {
+        return false;
+    }
+
+    const ggml_tensor * mask = nullptr;
+    const ggml_tensor * mrs  = nullptr;
+    if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_CPY) {
+        // the cast may have other users, so it still runs; the fused kernel reads the mask directly
+        const ggml_tensor * cpy = next(GGML_OP_CPY, nullptr, -1);
+        if (!cpy || cpy->type != GGML_TYPE_F32) {
+            return false;
+        }
+        mask  = cpy->src[0];
+        m.cpy = const_cast<ggml_tensor *>(cpy);
+        mrs   = next(GGML_OP_RESHAPE, cpy, 1);
+    } else {
+        mrs  = next(GGML_OP_RESHAPE, nullptr, 1);
+        mask = mrs ? mrs->src[0] : nullptr;
+    }
+    if (!mrs || !mask || (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) || mask->nb[0] != ggml_type_size(mask->type) ||
+            mask->ne[0] != c2->ne[0]) {
+        return false;
+    }
+    ggml_tensor * out = cgraph->nodes[j + 1 < cgraph->n_nodes ? j + 1 : j];
+    if (!next(GGML_OP_ADD, c2, -1) || out->src[1] != mrs || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+            ggml_nelements(out) != c2->ne[0]) {
+        return false;
+    }
+
+    m.n_nodes  = j - i + 1;
+    m.n_head   = n_head;
+    m.keys     = keys;
+    m.q        = q;
+    m.bias     = badd->src[1];
+    m.cell_blk = gr->src[1];
+    m.mask     = mask;
+    m.dst      = out;
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4059,6 +4266,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_GET_ROWS) {
+        static const bool no_qsa_pool = getenv("GGML_CUDA_NO_QSA_POOL") != nullptr;
+        ggml_cuda_qsa_pool_match m;
+        if (!no_qsa_pool && ggml_cuda_match_qsa_pool(cgraph, i, m)) {
+            const int out_idx = i + m.n_nodes - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, m.n_nodes, &out_idx, 1)) {
+                ggml_cuda_op_qsa_pool_norm_rope(*cuda_ctx, node, m.r, m.scale, m.rms_norm, m.mul, m.rope);
+                return m.n_nodes - 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->src[0]->ne[0] == 128) {
+        static const bool no_qsa_score = getenv("GGML_CUDA_NO_QSA_SCORE") != nullptr;
+        ggml_cuda_qsa_score_match m;
+        if (!no_qsa_score && ggml_cuda_match_qsa_score(cgraph, i, m)) {
+            const int out_idx = i + m.n_nodes - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, m.n_nodes, &out_idx, 1)) {
+                if (m.cpy != nullptr) {
+                    ggml_cuda_cpy(*cuda_ctx, m.cpy->src[0], m.cpy->src[1]);
+                }
+                ggml_cuda_op_qsa_score(*cuda_ctx, m.keys, m.q, m.n_head, m.bias, m.cell_blk, m.mask, m.dst);
+                return m.n_nodes - 1;
+            }
+        }
+    }
 
     // SIGMOID -> MUL -> ADD: b + a * sigmoid(g), g one value per row (shared-expert gate)
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
