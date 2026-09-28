@@ -12,7 +12,7 @@ and validated against the canonical paths (KL divergence against an
 unfused single-token baseline, test-backend-ops cases, a single-op
 reference check for the repacked kernels).
 
-Recently update for Qwen-3.8-flash-next (9/28)
+Recently updated for Qwen-3.8-flash-next (9/28)
 
 Branches:
 
