@@ -4,11 +4,30 @@ A retune of llama.cpp for AMD Vega 20 (gfx906: Instinct MI50/MI60,
 Radeon VII / Pro VII). Adds a GCN weight-repacking GPU buffer type and
 DPP-based warp reductions, ported from the
 [reinstinct](https://github.com/sixvolts/reinstinct) inference engine
-where these techniques ship in production. Everything is measured on
-real hardware with cold-start A/B discipline and perplexity-validated
-against the canonical paths.
+where these techniques ship in production, and the kernels, memory
+layout and server changes needed to serve a 177B sparse-attention MoE
+(Qwen3.8-Flash-Next / Swift 1.5, `qwen4exp`) across four MI50s.
+Everything is measured on real hardware with cold-start A/B discipline
+and validated against the canonical paths (KL divergence against an
+unfused single-token baseline, test-backend-ops cases, a single-op
+reference check for the repacked kernels).
 
+Branches:
 
+- `gfx906-perf`: the single-GPU retune as reviewable commits on top of
+  upstream b9587 (76da2450a, June 2026).
+- `gfx906-perf-upstream`: the same work rebased onto upstream
+  e6ab7c1a4 (2026-09-22) plus the multi-GPU and qwen4exp work, 87
+  commits. Each commit message carries its measured A/B numbers and
+  validation.
+- `qwen4exp-mtp`: `gfx906-perf-upstream` plus the qwen4exp NextN/MTP
+  draft head (port of upstream PR #28243) with two fixes: the scheduler
+  is re-reserved when the nextn output is switched on (without it every
+  prompt ubatch reallocated and drained all devices), and the draft's
+  prompt catch-up is deferred by one batch so the target pipeline is not
+  drained.
+
+## Single GPU
 
 Measured on an MI50 32 GB (1825 MHz sclk / 1125 MHz mclk / 300 W),
 `-fa 1`, vs the stock master this branch is based on (throughput in
@@ -20,8 +39,6 @@ tok/s, llama-bench pp512 / tg128):
 | Qwen 3.6 35B-A3B UD-Q4_K_XL (MoE) | 864.4 / 89.9 | **967.9 / 89.9** (+12% / parity) |
 | Qwen 3.5 0.8B UD-Q4_K_XL | 4772 / 219.9 | **5324 / 220.3** (+12% / par) |
 
-Significant improvements vs the iacopPBK-lineage gfx906 forks.
-
 What it does:
 
 - **Three-plane K-quant weight repack** (Q4_K/Q5_K/Q6_K, 2D and MoE
@@ -32,25 +49,106 @@ What it does:
   throughout. On by default on GCN devices; `GGML_CUDA_REPACK=0`
   disables it (required for `llama-quantize`/save: repacked weights
   cannot be read back).
-- **DPP/ds_swizzle warp reductions** under the GCN define — single
+- **DPP/ds_swizzle warp reductions** under the GCN define - single
   VALU lane exchanges instead of `ds_bpermute` LDS roundtrips in every
   warp reduction backend-wide.
 - **MoE (MUL_MAT_ID) support** with direct in-kernel expert routing at
   decode and a grouped 16-token-tile GEMM for prefill.
-- `GGML_CUDA_REPACK_Q8_0=1` additionally repacks Q8_0 (prefill +43%,
-  decode -3% vs canonical — opt-in until retuned).
+- `GGML_CUDA_REPACK_Q8_0=1` and `GGML_CUDA_REPACK_Q5_1=1` additionally
+  repack Q8_0 and Q5_1 (opt-in; both are on in the multi-GPU config).
 
-Build (ROCm, gfx906):
+## Four MI50s: Qwen3.8-Flash-Next / Swift 1.5 (177B MoE, UD-Q4_K_XL)
+
+Layer split across 4x MI50 32 GB (ROCm 7.1). gfx906 PCIe peer copies
+crash inside the HIP runtime, so the build uses
+`-DGGML_CUDA_NO_PEER_COPY=ON`; the fork replaces the synchronous
+host-staged copy that implies with asynchronous staged copies so the
+layer-split prompt pipeline still overlaps. On top of the single-GPU
+work this branch adds:
+
+- qwen4exp kernels: LDS-resident gated delta net prefill and decode,
+  the QSA indexer key pooling and block scoring as fused kernels, a
+  block-layout cache kept between decode calls (one sequence, and a
+  unified cache holding several), sparse decode attention that reads
+  only the selected keys (a gather path and a one-query kernel that now
+  takes up to 16 query rows), a parallel top-k radix select, and the
+  hyper-connection and shared-expert tail fusions.
+- Small-batch paths for speculative verify and for several decoding
+  sequences: multi-column repacked Q8_0 matvecs, MoE through the
+  per-slot decode kernels, and the single-token fusions (quantize on
+  the way out, grouped matvecs, hc mix tail) extended to a few columns.
+- Server: context checkpoints copied on the device streams into pinned
+  memory (`--ctx-checkpoints-async`), so a checkpoint no longer drains
+  the devices and splits the prompt pipeline; `--ctx-checkpoints-tail-only`
+  drops the checkpoint one ubatch before the prompt end.
+
+Production configuration used for the numbers below: 4 slots with a
+unified 128K cache (49152 per slot), `-b 4096 -ub 2048 -fa on`,
+`--tensor-split 0.20,0.267,0.267,0.266`, 4 async checkpoints,
+`GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q5_1=1`; the MTP column runs
+the draft head with `--spec-draft-n-max 2` on the first GPU. Prefill is
+one warm request (median of 3); decode is one request's generation rate
+after a prompt of the given depth (temperature 0, 256 tokens);
+concurrent rows give each request's own rate while the others run.
+
+| Measurement | Depth | MTP n2 | No speculation |
+|---|---|---:|---:|
+| Prefill, t/s | 8K | 929 | **1268** |
+| Prefill, t/s | 16K | 1029 | **1262** |
+| Prefill, t/s | 32K | 919 | **1198** |
+| Decode, wikitext continuation | 64 | **67.4** (acc 89%) | 48.3 |
+| Decode, wikitext continuation | 8K | **51.3** (acc 60%) | 43.9 |
+| Decode, wikitext continuation | 16K | **51.8** (acc 64%) | 42.6 |
+| Decode, summary instruction | 8K | **59.7** (acc 80%) | 45.3 |
+| Decode, summary instruction | 32K | **59.3** (acc 85%) | 43.0 |
+| 1 user, per-user decode | short | **58.3** | 44.8 |
+| 2 users, per-user decode (aggregate) | short | **36.2** (72) | 23.8 (48) |
+| 4 users, per-user decode (aggregate) | short | 19.3 (77) | **23.0** (92) |
+| 4 users, per-user decode, prompts prefilling concurrently | 8K each | 9.8 | **13.3** |
+| 4 users, per-user decode, prompts prefilling concurrently | 32K each | 6.4 | **7.4** |
+
+Decode-only scaling (llama-batched-bench, no speculation, the same
+unified pool; aggregate t/s, per sequence in parentheses):
+
+| Sequences | 8K each | 32K each |
+|---|---:|---:|
+| 1 | 44.2 | 44.2 |
+| 2 | 67.1 (33.6) | 63.3 (31.7) |
+| 4 | 89.8 (22.4) | 80.8 (20.2) |
+
+Where it started: the same model on the same machine did 796 t/s
+prefill and 51 t/s decode with one slot before this work, and the first
+multi-slot build lost about a third of its prefill to the scheduler
+reallocation bug fixed on `qwen4exp-mtp`. MTP's draft acceptance depends
+on the text (60-65% on raw wikitext continuation, 80-89% on
+instruction-style output), so its single-user decode gain ranges from
++17% to +40%; it costs 18-27% of prefill and loses at four users. Four
+long prompts arriving together are the weak spot: with a unified cache
+the QSA indexer scores every prompt token against the whole pool, so
+four 32K prompts prefill at about 650 t/s aggregate against 1160 for
+one.
+
+Environment switches for A/B (all default on): `GGML_CUDA_NO_Q8_NC`,
+`GGML_CUDA_NO_MOE_SMALL`, `GGML_CUDA_NO_F32_NC`, `GGML_CUDA_NO_FA_DEC`,
+`GGML_CUDA_NO_FA_GATHER`, `GGML_CUDA_NO_QSA_POOL`,
+`GGML_CUDA_NO_QSA_SCORE`, `GGML_CUDA_NO_Q8_MULTI`,
+`GGML_CUDA_NO_HC_UP_PRE`, `GGML_CUDA_NO_Q8_EMIT`,
+`GGML_CUDA_NO_REPACK_FLATTEN`, `LLAMA_QSA_NO_MS_CACHE`. Diagnostics:
+`LLAMA_QSA_LAYOUT_CHECK=1` (rebuild and compare the cached block layout
+every call), `GGML_SCHED_TIME=1` (per-split waits and graph
+reallocation reasons), `LLAMA_DECODE_TIME=1` (per-ubatch phase times)
+and, on `qwen4exp-mtp`, `LLAMA_SPEC_TIME=1` and `LLAMA_SPEC_NO_DEFER=1`.
+
+Build (ROCm, gfx906; add `-DGGML_CUDA_NO_PEER_COPY=ON` for more than
+one gfx906 card):
 
     cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx906 \
-          -DGGML_HIP_GRAPHS=ON -DCMAKE_BUILD_TYPE=Release
+          -DGGML_HIP_GRAPHS=ON -DGGML_CUDA_NO_PEER_COPY=ON \
+          -DCMAKE_BUILD_TYPE=Release
     cmake --build build -j
 
-Branch `gfx906-perf` carries the work as reviewable commits on top of
-upstream master (b9587 / 76da2450a, June 2026); each commit message
-includes its measured A/B numbers and validation. This repo is not
-affiliated with the upstream llama.cpp project — upstream README
-follows below.
+This repo is not affiliated with the upstream llama.cpp project -
+upstream README follows below.
 
 ---
 
