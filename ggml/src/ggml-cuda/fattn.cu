@@ -781,8 +781,12 @@ static __device__ __forceinline__ int fattn_gather_scan(const int v, int & total
     return base + incl - v;
 }
 
-static __global__ void __launch_bounds__(256) fattn_gather_count(const half * __restrict__ mask, const int n_kv, int * __restrict__ counts) {
+// blockIdx.y selects the mask row (a query); counts hold gridDim.x entries per row and idx n_sel per row
+static __global__ void __launch_bounds__(256) fattn_gather_count(const half * __restrict__ mask, const int n_kv, int * __restrict__ counts,
+        const int64_t mask_row) {
     __shared__ int wsum[4];
+    mask   += blockIdx.y*mask_row;
+    counts += blockIdx.y*gridDim.x;
     const int flags = fattn_gather_flags(mask, n_kv, blockIdx.x*FATTN_GATHER_CHUNK + threadIdx.x*8);
     int total;
     fattn_gather_scan(__popc(flags), total, wsum);
@@ -792,8 +796,12 @@ static __global__ void __launch_bounds__(256) fattn_gather_count(const half * __
 }
 
 static __global__ void __launch_bounds__(256) fattn_gather_compact(
-        const half * __restrict__ mask, const int n_kv, const int * __restrict__ counts, int32_t * __restrict__ idx, const int n_sel) {
+        const half * __restrict__ mask, const int n_kv, const int * __restrict__ counts, int32_t * __restrict__ idx, const int n_sel,
+        const int64_t mask_row) {
     __shared__ int wsum[4];
+    mask   += blockIdx.y*mask_row;
+    counts += blockIdx.y*gridDim.x;
+    idx    += blockIdx.y*n_sel;
     int before = 0;
     int all    = 0;
     for (int k = 0; k < (int) gridDim.x; ++k) {
@@ -854,19 +862,21 @@ static __global__ void fattn_gather_rows(
 
 static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// One query, f16 K/V, for the sparse-attention ops (n_kv_max hint): a block scores FATTN_DEC_C keys
+// Up to FATTN_DEC_MAX_Q queries (one per mask row), f16 K/V, for the sparse-attention ops (n_kv_max hint): a block scores FATTN_DEC_C keys
 // against every query head of one KV head (lanes = keys, waves = slices of the heads), turns the scores
 // into chunk-local softmax weights and accumulates the V rows (threads = dims). fattn_dec_combine then
 // merges the chunks. Keys are read through idx (the finite mask columns) or are the cells themselves.
 static constexpr int FATTN_DEC_C     = 64;
 static constexpr int FATTN_DEC_MAX_C = 128; // chunks the combine kernel takes
+static constexpr int FATTN_DEC_MAX_Q = 16;  // query rows per launch (verify batches, decoding sequences)
 
 template <int D, int G>
 static __global__ void __launch_bounds__(256) fattn_dec_chunk(
         const float * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V, const half * __restrict__ mask,
         const int32_t * __restrict__ idx, const int n_keys, const float scale,
         const int64_t q_sh, const int64_t nb11, const int64_t nb12, const int64_t nb21, const int64_t nb22,
-        float * __restrict__ part_o, float2 * __restrict__ part_ml) {
+        float * __restrict__ part_o, float2 * __restrict__ part_ml,
+        const int64_t q_row, const int64_t mask_row, const int n_sel) {
     constexpr int C  = FATTN_DEC_C; // keys per block, one per lane
     constexpr int DW = D/4;         // dims per wave in the scores
 
@@ -878,6 +888,15 @@ static __global__ void __launch_bounds__(256) fattn_dec_chunk(
     const int chunk = blockIdx.x;
     const int g     = blockIdx.y;   // KV head
     const int n_kvh = gridDim.y;
+    // blockIdx.z is the query: its own Q row, mask row, index list and partial buffers
+    {
+        const int iq = blockIdx.z;
+        Q    += iq*q_row;
+        mask  = mask ? mask + iq*mask_row : mask;
+        idx   = idx  ? idx  + (int64_t) iq*n_sel : idx;
+        part_o  += (int64_t) iq*gridDim.x*n_kvh*G*D;
+        part_ml += (int64_t) iq*gridDim.x*n_kvh*G;
+    }
     const int tid   = threadIdx.x;
     const int lane  = tid % 64;
     const int wave  = tid / 64;
@@ -987,6 +1006,10 @@ static __global__ void __launch_bounds__(256) fattn_dec_combine(
     const int g     = hq / G;
     const int h     = hq % G;
     const int tid   = threadIdx.x;
+    // blockIdx.y is the query
+    part_o  += (int64_t) blockIdx.y*n_chunks*n_kvh*G*D;
+    part_ml += (int64_t) blockIdx.y*n_chunks*n_kvh*G;
+    dst     += (int64_t) blockIdx.y*gridDim.x*D;
 
     float2 ml = make_float2(-INFINITY, 0.0f);
     if (tid < n_chunks) {
@@ -1045,7 +1068,10 @@ static bool ggml_cuda_flash_attn_ext_decode(ggml_backend_cuda_context & ctx, ggm
     const int64_t D = K->ne[0];
     const int     G = K->ne[2] > 0 ? (int) (Q->ne[2] / K->ne[2]) : 0;
 
-    if (Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+    // up to FATTN_DEC_MAX_Q queries (speculative verify, several decoding sequences): each is a mask row
+    const int n_q = (int) Q->ne[1];
+    if (n_q < 1 || n_q > FATTN_DEC_MAX_Q || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            mask->ne[1] < n_q || Q->nb[1] % 16 != 0 ||
             Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
             max_bias != 0.0f || logit_softcap != 0.0f || K->ne[2] != V->ne[2] || V->ne[0] != D || Q->ne[0] != D ||
@@ -1068,25 +1094,29 @@ static bool ggml_cuda_flash_attn_ext_decode(ggml_backend_cuda_context & ctx, ggm
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t stream = ctx.stream();
 
+    const int64_t mask_row = mask->nb[1]/sizeof(half);
+    const int64_t q_row    = Q->nb[1]/sizeof(float);
+
     const int n_cnt = (int) ((K->ne[1] + FATTN_GATHER_CHUNK - 1)/FATTN_GATHER_CHUNK);
-    ggml_cuda_pool_alloc<int32_t> idx(pool, sparse ? n_sel + n_cnt : 1);
+    ggml_cuda_pool_alloc<int32_t> idx(pool, sparse ? (size_t) n_q*(n_sel + n_cnt) : 1);
     if (sparse) {
-        int32_t * counts = idx.get() + n_sel;
-        fattn_gather_count<<<n_cnt, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts);
-        fattn_gather_compact<<<n_cnt, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel);
+        int32_t * counts = idx.get() + (size_t) n_q*n_sel;
+        fattn_gather_count<<<dim3(n_cnt, n_q, 1), 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, mask_row);
+        fattn_gather_compact<<<dim3(n_cnt, n_q, 1), 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel, mask_row);
     }
 
-    ggml_cuda_pool_alloc<float>  part_o (pool, (size_t) n_ch*n_kvh*G*D);
-    ggml_cuda_pool_alloc<float2> part_ml(pool, (size_t) n_ch*n_kvh*G);
+    ggml_cuda_pool_alloc<float>  part_o (pool, (size_t) n_q*n_ch*n_kvh*G*D);
+    ggml_cuda_pool_alloc<float2> part_ml(pool, (size_t) n_q*n_ch*n_kvh*G);
 
     auto launch = [&](auto d_c, auto g_c) {
         constexpr int DT = decltype(d_c)::value;
         constexpr int GT = decltype(g_c)::value;
-        fattn_dec_chunk<DT, GT><<<dim3(n_ch, n_kvh, 1), 256, 0, stream>>>(
+        fattn_dec_chunk<DT, GT><<<dim3(n_ch, n_kvh, n_q), 256, 0, stream>>>(
             (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,
             sparse ? idx.get() : nullptr, (int) n_keys, scale,
-            Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], part_o.get(), part_ml.get());
-        fattn_dec_combine<DT><<<n_kvh*GT, 256, 0, stream>>>(part_o.get(), part_ml.get(), (float *) dst->data, n_ch, GT);
+            Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], part_o.get(), part_ml.get(),
+            q_row, mask_row, (int) n_sel);
+        fattn_dec_combine<DT><<<dim3(n_kvh*GT, n_q, 1), 256, 0, stream>>>(part_o.get(), part_ml.get(), (float *) dst->data, n_ch, GT);
     };
     auto launch_g = [&](auto d_c) {
         switch (G) {
@@ -1179,8 +1209,8 @@ static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggm
     cudaStream_t stream = ctx.stream();
 
     int32_t * counts = idx.get() + n_sel;
-    fattn_gather_count<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts);
-    fattn_gather_compact<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel);
+    fattn_gather_count<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, 0);
+    fattn_gather_compact<<<n_chunks, 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel, 0);
     fattn_gather_rows<<<(n_sel + 3)/4, 256, 0, stream>>>((const char *) K->data, (const char *) V->data, (const half *) mask->data, idx.get(),
         Kg.get(), Vg.get(), maskg.get(), n_head, row_k, row_v, K->nb[1], K->nb[2], V->nb[1], V->nb[2],
         mask->nb[1]/sizeof(half), n_mrow, (int) n_sel);
