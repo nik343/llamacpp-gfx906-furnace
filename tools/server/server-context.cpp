@@ -301,6 +301,8 @@ struct server_slot {
             return false;
         }
 
+        common_speculative_flush(spec); // the saved draft state must include any postponed catch-up
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -544,6 +546,10 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            // a request cancelled mid-prompt may leave a postponed draft catch-up for this sequence;
+            // run it now, before the slot's draft memory is reused
+            common_speculative_flush(spec);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1259,6 +1265,26 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+
+                // a speculative implementation may change the target's graph (the MTP head enables the
+                // nextn output), and the scheduler re-reserves its worst-case buffers on the next decode.
+                // do that decode now, so the ~2 s reservation, and any fallback it takes, happen at startup
+                // where the start check can see them instead of on the first request
+                if (spec) {
+                    const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+                    llama_token tok = llama_vocab_bos(vocab_tgt);
+                    if (tok == LLAMA_TOKEN_NULL) {
+                        tok = llama_vocab_eos(vocab_tgt);
+                    }
+                    if (tok == LLAMA_TOKEN_NULL) {
+                        tok = 0;
+                    }
+                    if (llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1)) != 0) {
+                        SRV_WRN("%s", "post-speculative warmup decode failed\n");
+                    }
+                    llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                    llama_synchronize(ctx_tgt);
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -2361,6 +2387,7 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, params_base.ctx_checkpoints_async);
+        common_speculative_flush(spec.get()); // the draft state must include any postponed catch-up
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3020,6 +3047,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            common_speculative_flush(spec.get());
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
@@ -3058,6 +3086,8 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                common_speculative_flush(spec.get());
+
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3747,7 +3777,12 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
+                // a batch without outputs is prompt processing: let the draft catch-up wait until the
+                // next target decode has been enqueued, so the target pipeline is not drained here
+                static const bool no_defer = getenv("LLAMA_SPEC_NO_DEFER") != nullptr;
+                ok = (has_output || no_defer)
+                    ? common_speculative_process(spec.get(), batch_view)
+                    : common_speculative_process_deferred(spec.get(), batch_view);
             });
 
             if (!ok) {

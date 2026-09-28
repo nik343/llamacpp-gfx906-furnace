@@ -107,6 +107,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Number of decodes that reached compute so far; pairs with llama_get_embeddings_nextn_for
+LLAMA_API uint32_t llama_get_n_decodes(const struct llama_context * ctx);
+
+// Unmasked nextn rows of the decode numbered `decode_no`. The latest decode waits for the whole
+// context (as llama_get_embeddings_nextn does); the decode before it waits only for that decode's
+// rows, so the caller can read them while the next decode is still running. Older rows are gone: NULL.
+LLAMA_API float * llama_get_embeddings_nextn_for(struct llama_context * ctx, uint32_t decode_no);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

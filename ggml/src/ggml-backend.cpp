@@ -1655,6 +1655,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
+        {
+            static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+            if (sched_time) {
+                GGML_LOG_INFO("%s: graph reallocation: backend_ids_changed = %d, nodes = %d, leafs = %d (syncs every backend)\n", __func__,
+                        backend_ids_changed, sched->graph.n_nodes, sched->graph.n_leafs);
+            }
+        }
 
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
@@ -1704,6 +1711,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        // GGML_SCHED_TIME=1: host time spent per split in each wait/copy phase
+        const int64_t t_split0 = ggml_time_us();
+        int64_t t_prev_wait = 0, t_inputs = 0, t_compute = 0;
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1712,7 +1723,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            t_prev_wait = ggml_time_us() - t_split0;
         }
+
+        const int64_t t_inputs0 = ggml_time_us();
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1842,7 +1856,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            t_inputs = ggml_time_us() - t_inputs0;
+            const int64_t t_compute0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            t_compute = ggml_time_us() - t_compute0;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1886,6 +1903,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+
+        {
+            static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
+            if (sched_time) {
+                GGML_LOG_INFO("sched split %d %s: n_inputs %d, prev-wait %.1f ms, inputs %.1f ms, compute-enqueue %.1f ms, total %.1f ms (copy %d)\n",
+                        split_id, ggml_backend_name(split_backend), split->n_inputs, t_prev_wait / 1000.0, t_inputs / 1000.0,
+                        t_compute / 1000.0, (ggml_time_us() - t_split0) / 1000.0, sched->cur_copy);
+            }
+        }
     }
 
         return GGML_STATUS_SUCCESS;

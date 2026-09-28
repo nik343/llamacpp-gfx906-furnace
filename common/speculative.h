@@ -79,6 +79,14 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// like common_speculative_process, but an implementation may postpone its work until the next call
+// into it (process, draft, begin or flush). the caller then enqueues the next target decode before
+// the implementation waits for this batch's target outputs, so the target pipeline is not drained
+bool common_speculative_process_deferred(common_speculative * spec, const llama_batch & batch);
+
+// complete any postponed process() work
+void common_speculative_flush(common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

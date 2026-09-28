@@ -84,6 +84,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// LLAMA_DECODE_TIME=1: log how long the per-ubatch compute enqueue and the nextn extraction take
+static bool decode_time_log() {
+    static const bool v = getenv("LLAMA_DECODE_TIME") != nullptr;
+    return v;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -486,6 +492,12 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto & ev : ev_nextn) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
     for (auto & kv : state_async_events) {
         if (kv.second) {
             ggml_backend_event_free(kv.second);
@@ -1011,10 +1023,38 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::embd_nextn_base(uint32_t decode_no) {
+    if (embd_nextn.data == nullptr || cparams.embeddings_nextn_masked) {
+        return embd_nextn.data;
+    }
+
+    return embd_nextn.data + (size_t) (decode_no & 1) * cparams.n_batch * model.hparams.n_embd_out();
+}
+
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
-    return embd_nextn.data;
+    return embd_nextn_base(n_decodes);
+}
+
+float * llama_context::get_embeddings_nextn_for(uint32_t decode_no) {
+    if (decode_no == n_decodes) {
+        synchronize();
+        return get_embeddings_nextn();
+    }
+
+    if (cparams.embeddings_nextn_masked || decode_no + 1 != n_decodes) {
+        return nullptr;
+    }
+
+    const int half = decode_no & 1;
+    if (ev_nextn[half] == nullptr || ev_nextn_no[half] != decode_no) {
+        return nullptr;
+    }
+
+    ggml_backend_event_synchronize(ev_nextn[half]);
+
+    return embd_nextn_base(decode_no);
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -1029,10 +1069,10 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
-            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size) {
-                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / n_embd));
+            if (i < 0 || (uint32_t) i >= cparams.n_batch) {
+                throw std::runtime_error(format("out of range [0, %u)", cparams.n_batch));
             }
-            return embd_nextn.data + (size_t) i * n_embd;
+            return embd_nextn_base(n_decodes) + (size_t) i * n_embd;
         }
 
         const int64_t j = output_resolve_row(i);
@@ -1238,8 +1278,18 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool changed = cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked;
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // the graph topology changes with nextn output (qwen4exp moves the output gather past the last
+    // layer). without a fresh worst-case reservation the scheduler falls back to reallocating on the
+    // first mismatching graph, shrinks its reservation to that ubatch, and then reallocates, with a
+    // full drain of every device, on every later ubatch whose inputs grow
+    if (changed) {
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1427,12 +1477,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = nullptr;
         res->reset();
 
+        const int64_t t_ph0 = ggml_time_us();
         ggml_backend_sched_reset(sched.get());
+        const int64_t t_ph1 = ggml_time_us();
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        const int64_t t_ph2 = ggml_time_us();
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1442,7 +1495,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const int64_t t_ph3a = ggml_time_us();
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        const int64_t t_ph3 = ggml_time_us();
+        if (decode_time_log()) {
+            LLAMA_LOG_INFO("%s: phases: sched_reset %.1f ms, build_graph %.1f ms, alloc_graph %.1f ms\n", __func__,
+                    (t_ph1 - t_ph0) / 1000.0, (t_ph2 - t_ph1) / 1000.0, (t_ph3 - t_ph3a) / 1000.0);
+        }
+        if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1456,12 +1516,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const int64_t t_si0 = ggml_time_us();
         res->set_inputs(&ubatch);
+        if (decode_time_log()) {
+            LLAMA_LOG_INFO("%s: phases: set_inputs %.1f ms\n", __func__, (ggml_time_us() - t_si0) / 1000.0);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_gc0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (decode_time_log()) {
+        LLAMA_LOG_INFO("%s: phases: graph_compute %.1f ms\n", __func__, (ggml_time_us() - t_gc0) / 1000.0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1932,6 +2000,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
+    // a decode that failed to find a memory slot above never reaches this point, so a batch the
+    // caller retries at a smaller size does not flip the nextn buffer twice
+    n_decodes++;
+
+    ggml_backend_t backend_nextn = nullptr;
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -1963,7 +2037,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         turboprefill.stage_for_ubatch(ubatch.n_tokens, cparams.n_ubatch);
 
+        const int64_t t_ub0 = ggml_time_us();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (decode_time_log()) {
+            LLAMA_LOG_INFO("%s: ubatch %u tokens: process_ubatch (graph build + compute enqueue) %.1f ms\n", __func__,
+                    ubatch.n_tokens, (ggml_time_us() - t_ub0) / 1000.0);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2096,12 +2175,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
+                GGML_ASSERT(backend_nextn == nullptr || backend_nextn == backend_h);
+                backend_nextn = backend_h;
 
                 const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                float * embd_nextn_out = embd_nextn_base(n_decodes) + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) (masked ? embd_nextn.size : (size_t) cparams.n_batch*n_embd));
+                const int64_t t_get0 = ggml_time_us();
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (decode_time_log()) {
+                    LLAMA_LOG_INFO("%s: ubatch %u tokens: nextn get_async %.1f ms (%.1f MB, backend %s)\n", __func__,
+                            ubatch.n_tokens, (ggml_time_us() - t_get0) / 1000.0, n_rows*n_embd*4.0/1e6, ggml_backend_name(backend_h));
+                }
             }
         }
 
@@ -2122,6 +2208,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // The scheduler only reads turboprefill.stage while processing one ubatch graph.
     turboprefill.finish_batch();
+
+    // the extraction copies above sit on this backend's stream, so the event completes once the rows
+    // of this decode have landed, whatever the other devices are still doing
+    if (backend_nextn != nullptr && !cparams.embeddings_nextn_masked) {
+        const int half = n_decodes & 1;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_nextn);
+        if (ev_nextn[half] != nullptr && ev_nextn_dev[half] != dev) {
+            ggml_backend_event_free(ev_nextn[half]);
+            ev_nextn[half] = nullptr;
+        }
+        if (ev_nextn[half] == nullptr) {
+            ev_nextn[half]     = ggml_backend_event_new(dev);
+            ev_nextn_dev[half] = dev;
+        }
+        if (ev_nextn[half] != nullptr) {
+            ggml_backend_event_record(ev_nextn[half], backend_nextn);
+            ev_nextn_no[half] = n_decodes;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2215,7 +2320,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        // two halves, selected by decode parity (see embd_nextn_base)
+        embd_nextn.size = (size_t) 2 * n_embd_out * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2250,6 +2356,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
             synchronize();
+
+            // the previous decode's nextn rows may still be awaited by a deferred reader
+            if (embd_nextn.data != nullptr && embd_nextn.size > 0) {
+                embd_nextn_keep.assign(embd_nextn.data, embd_nextn.data + embd_nextn.size);
+            }
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -2289,6 +2400,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    if (!embd_nextn_keep.empty()) {
+        if (embd_nextn.data != nullptr) {
+            std::memcpy(embd_nextn.data, embd_nextn_keep.data(), std::min(embd_nextn.size, embd_nextn_keep.size()) * sizeof(float));
+        }
+        embd_nextn_keep.clear();
+        embd_nextn_keep.shrink_to_fit();
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2394,7 +2513,8 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        // unmasked nextn rows are indexed by token position, not by output, so the swaps do not apply
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
@@ -4188,6 +4308,14 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+uint32_t llama_get_n_decodes(const llama_context * ctx) {
+    return ctx->get_n_decodes();
+}
+
+float * llama_get_embeddings_nextn_for(llama_context * ctx, uint32_t decode_no) {
+    return ctx->get_embeddings_nextn_for(decode_no);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

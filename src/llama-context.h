@@ -93,6 +93,13 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // decodes that reached compute so far
+    uint32_t get_n_decodes() const { return n_decodes; }
+
+    // unmasked nextn rows of decode `decode_no`: the latest decode waits for the whole context, the
+    // one before it waits only for the event its rows were recorded behind, older rows are gone (NULL)
+    float * get_embeddings_nextn_for(uint32_t decode_no);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -306,6 +313,19 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // unmasked nextn rows are double buffered by decode parity, so a caller can still read the previous
+    // decode's rows after the next decode has been enqueued. an event recorded behind each decode's
+    // extraction lets it wait for that decode alone instead of draining every device
+    uint32_t             n_decodes         = 0;
+    ggml_backend_event_t ev_nextn[2]       = {nullptr, nullptr};
+    ggml_backend_dev_t   ev_nextn_dev[2]   = {nullptr, nullptr};
+    uint32_t             ev_nextn_no[2]    = {0, 0};
+
+    float * embd_nextn_base(uint32_t decode_no);
+
+    // nextn rows carried across an output buffer reallocation
+    std::vector<float> embd_nextn_keep;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
