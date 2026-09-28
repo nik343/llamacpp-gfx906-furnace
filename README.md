@@ -14,18 +14,18 @@ reference check for the repacked kernels).
 
 Branches:
 
-- `gfx906-perf`: the single-GPU retune as reviewable commits on top of
-  upstream b9587 (76da2450a, June 2026).
-- `gfx906-perf-upstream`: the same work rebased onto upstream
-  e6ab7c1a4 (2026-09-22) plus the multi-GPU and qwen4exp work, 87
-  commits. Each commit message carries its measured A/B numbers and
-  validation.
-- `qwen4exp-mtp`: `gfx906-perf-upstream` plus the qwen4exp NextN/MTP
-  draft head (port of upstream PR #28243) with two fixes: the scheduler
-  is re-reserved when the nextn output is switched on (without it every
-  prompt ubatch reallocated and drained all devices), and the draft's
-  prompt catch-up is deferred by one batch so the target pipeline is not
-  drained.
+- `gfx906-perf` (default): everything below. The retune rebased onto
+  upstream e6ab7c1a4 (2026-09-22), the multi-GPU and qwen4exp work, and
+  the qwen4exp NextN/MTP draft head (port of upstream PR #28243) with two
+  fixes: the scheduler is re-reserved when the nextn output is switched
+  on (without it every prompt ubatch reallocated and drained all
+  devices), and the draft's prompt catch-up is deferred by one batch so
+  the target pipeline is not drained. A merge commit joins the earlier
+  b9587-based history; each commit message carries its measured A/B
+  numbers and validation.
+- `gfx906-perf-upstream` and `qwen4exp-mtp`: the development branches the
+  default branch was assembled from (the kernel/server work without and
+  with the MTP head).
 
 ## Single GPU
 
