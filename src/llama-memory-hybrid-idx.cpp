@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
@@ -142,6 +143,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 
 void llama_memory_hybrid_idx::clear(bool data) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     llama_memory_hybrid::clear(data);
 
@@ -152,6 +154,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
@@ -167,6 +170,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
@@ -177,6 +181,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     llama_memory_hybrid::seq_keep(seq_id);
 
@@ -187,6 +192,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
@@ -197,6 +203,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
@@ -232,6 +239,7 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
@@ -266,6 +274,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     qsa_layouts.clear();
+    qsa_layouts_ms.clear();
 
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
@@ -366,6 +375,128 @@ static bool qsa_layout_advance(llama_memory_hybrid_idx::qsa_layout & L, const ll
     return true;
 }
 
+// LLAMA_QSA_LAYOUT_CHECK=1: after a cached multi-sequence layout, run the full rebuild too and compare
+static bool qsa_layout_check() {
+    static const bool v = getenv("LLAMA_QSA_LAYOUT_CHECK") != nullptr;
+    return v;
+}
+
+// LLAMA_QSA_NO_MS_CACHE=1: disable the multi-sequence layout cache (full rebuild every call)
+static bool qsa_layout_ms_disabled() {
+    static const bool v = getenv("LLAMA_QSA_NO_MS_CACHE") != nullptr;
+    return v;
+}
+
+// bring a multi-sequence layout up to date with the cells: new cells join or open (bucket, sequence set)
+// groups and a group that fills becomes the next numbered block. returns false when the change is not
+// an append (a cell emptied, moved, doubled a slot, or the window changed), so the caller rebuilds
+static bool qsa_layout_ms_advance(llama_memory_hybrid_idx::qsa_layout_ms & L, const llama_kv_cells & cells,
+        int64_t n_kv, int64_t n_blocks, int64_t r) {
+    if (!L.valid || L.cells != (const void *) &cells || L.n_kv != n_kv || L.n_blocks != n_blocks || L.ratio != r) {
+        return false;
+    }
+
+    L.valid = false;
+    L.added.clear();
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        const int32_t p = cells.is_empty(j) ? -1 : cells.pos_get(j);
+        if (p != L.pos[j]) {
+            if (L.pos[j] != -1) {
+                return false;
+            }
+            L.added.push_back((int32_t) j);
+        }
+    }
+
+    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+
+    for (const int32_t j : L.added) {
+        const int32_t p  = cells.pos_get(j);
+        const int64_t pb = p/r;
+        if (pb >= n_blocks) {
+            return false;
+        }
+
+        const auto & S = cells.seq_get_all(j);
+
+        int32_t g = -1;
+        for (int32_t c = L.grp_head[pb]; c >= 0; c = L.grp_next[c]) {
+            if (L.grp_seq[c] == S) {
+                g = c;
+                break;
+            }
+        }
+        if (g < 0) {
+            g = (int32_t) L.grp_seq.size();
+            L.grp_seq  .push_back(S);
+            L.grp_slots.push_back(0);
+            L.grp_first.push_back(j);
+            L.grp_slot0.push_back(-1);
+            L.grp_bid  .push_back(-1);
+            L.grp_next .push_back(L.grp_head[pb]);
+            L.grp_head[pb] = g;
+        }
+
+        const uint64_t bit = uint64_t(1) << (p%r);
+        if ((L.grp_slots[g] & bit) != 0 || L.grp_bid[g] >= 0) {
+            return false;
+        }
+
+        L.pos[j]      = p;
+        L.cell_grp[j] = g;
+        L.grp_slots[g] |= bit;
+        L.grp_first[g]  = std::min(L.grp_first[g], j);
+        if (p%r == 0) {
+            L.grp_slot0[g] = j;
+        }
+
+        if (L.grp_slots[g] != slots_full) {
+            L.blk_of[j] = -1;
+            L.unpooled.push_back(j);
+            continue;
+        }
+
+        const int32_t bid = (int32_t) L.bid_idx.size();
+        if (bid >= n_blocks) {
+            return false;
+        }
+        L.grp_bid[g] = bid;
+        L.bid_idx .push_back((int32_t) (pb*r));
+        L.bid_cell.push_back(L.grp_first[g]);
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            L.blk_pos[sec*n_blocks + bid] = (int32_t) (pb*r);
+        }
+
+        // the other members wait in unpooled; the new cell is not there yet
+        size_t w = 0;
+        for (const int32_t c : L.unpooled) {
+            if (L.cell_grp[c] == g) {
+                L.blk_of[c]   = bid;
+                L.cell_blk[c] = bid;
+                L.blk_cells[bid*r + L.pos[c]%r] = c;
+            } else {
+                L.unpooled[w++] = c;
+            }
+        }
+        L.unpooled.resize(w);
+
+        L.blk_of[j]   = bid;
+        L.cell_blk[j] = bid;
+        L.blk_cells[bid*r + p%r] = j;
+    }
+
+    // the spare block follows the numbered ones
+    const int32_t n_bid    = (int32_t) L.bid_idx.size();
+    const int32_t dead_bid = n_bid < n_blocks ? n_bid : (int32_t) n_blocks - 1;
+    for (const int32_t c : L.unpooled) {
+        L.cell_blk[c] = dead_bid;
+    }
+
+    L.valid = true;
+    return true;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -439,9 +570,27 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         const bool one_seq = n_seq_present <= 1;
 
-        qsa_layout * lay = n_ns == 1 && one_seq ? &qsa_layouts[ratio] : nullptr;
+        qsa_layout    * lay    = n_ns == 1 &&  one_seq ? &qsa_layouts[ratio] : nullptr;
+        qsa_layout_ms * lay_ms = n_ns == 1 && !one_seq && !qsa_layout_ms_disabled() ? &qsa_layouts_ms[ratio] : nullptr;
 
-        const bool cached = lay != nullptr && qsa_layout_advance(*lay, cells, n_kv, n_blocks, r);
+        bool cached = lay != nullptr && qsa_layout_advance(*lay, cells, n_kv, n_blocks, r);
+
+        const bool cached_ms = lay_ms != nullptr && qsa_layout_ms_advance(*lay_ms, cells, n_kv, n_blocks, r);
+
+        // check mode: keep the cached layout aside, rebuild, then compare the two
+        std::vector<int32_t> chk_cell_blk;
+        std::vector<int32_t> chk_blk_cells;
+        std::vector<int32_t> chk_blk_pos;
+        int32_t              chk_n_bid = 0;
+
+        if (cached_ms && qsa_layout_check()) {
+            chk_cell_blk  = lay_ms->cell_blk;
+            chk_blk_cells = lay_ms->blk_cells;
+            chk_blk_pos   = lay_ms->blk_pos;
+            chk_n_bid     = (int32_t) lay_ms->bid_idx.size();
+        } else {
+            cached = cached || cached_ms;
+        }
 
         int32_t n_bid     = 0;
         bool    have_dead = false;
@@ -450,14 +599,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
         bool ranked = false;
 
         if (cached) {
-            memcpy(cur_cell_blk,  lay->cell_blk .data(), n_kv*sizeof(int32_t));
-            memcpy(cur_blk_cells, lay->blk_cells.data(), r*n_blocks*sizeof(int32_t));
-            memcpy(dst_blk_pos,   lay->blk_pos  .data(), 4*n_blocks*sizeof(int32_t));
+            const auto & c_cell_blk  = cached_ms ? lay_ms->cell_blk  : lay->cell_blk;
+            const auto & c_blk_cells = cached_ms ? lay_ms->blk_cells : lay->blk_cells;
+            const auto & c_blk_pos   = cached_ms ? lay_ms->blk_pos   : lay->blk_pos;
 
-            bid_idx  = lay->bid_idx;
-            bid_cell = lay->bid_cell;
+            memcpy(cur_cell_blk,  c_cell_blk .data(), n_kv*sizeof(int32_t));
+            memcpy(cur_blk_cells, c_blk_cells.data(), r*n_blocks*sizeof(int32_t));
+            memcpy(dst_blk_pos,   c_blk_pos  .data(), 4*n_blocks*sizeof(int32_t));
+
+            bid_idx  = cached_ms ? lay_ms->bid_idx  : lay->bid_idx;
+            bid_cell = cached_ms ? lay_ms->bid_cell : lay->bid_cell;
             if (!blk_bias) {
-                blk_of = lay->blk_of;
+                blk_of = cached_ms ? lay_ms->blk_of : lay->blk_of;
             }
 
             n_bid     = (int32_t) bid_idx.size();
@@ -696,6 +849,82 @@ void llama_memory_hybrid_idx::set_input_qsa(
                     lay->grp_first = grp_first;
                     lay->bid_idx   = bid_idx;
                     lay->bid_cell  = bid_cell;
+                }
+            }
+
+            // check mode: the cached layout must describe the same blocks as the rebuild. block numbers
+            // may differ, so compare per cell: same block position and the same member cells
+            if (!chk_cell_blk.empty()) {
+                const int32_t chk_dead = chk_n_bid < n_blocks ? chk_n_bid : (int32_t) n_blocks - 1;
+                bool ok = chk_n_bid == n_bid;
+                for (int64_t j = 0; ok && j < n_kv; ++j) {
+                    // an empty cell points anywhere in range (the mask hides it); the cache leaves it stale
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+                    const int32_t b1 = chk_cell_blk[j];
+                    const int32_t b2 = cur_cell_blk[j];
+                    const bool d1 = b1 == chk_dead && chk_n_bid < n_blocks; // in the spare block
+                    const bool d2 = blk_of[j] < 0;
+                    if (d1 || d2) {
+                        ok = d1 && d2;
+                        if (!ok) {
+                            LLAMA_LOG_ERROR("%s: qsa multi-sequence layout mismatch at cell %" PRId64 ": pooled state differs (cached %d, rebuilt %d)\n",
+                                    __func__, j, b1, b2);
+                        }
+                        continue;
+                    }
+                    ok = memcmp(chk_blk_cells.data() + (size_t) b1*r, cur_blk_cells + (size_t) b2*r, r*sizeof(int32_t)) == 0 &&
+                         chk_blk_pos[b1] == dst_blk_pos[b2];
+                    if (!ok) {
+                        LLAMA_LOG_ERROR("%s: qsa multi-sequence layout mismatch at cell %" PRId64 " (cached block %d, rebuilt block %d)\n",
+                                __func__, j, b1, b2);
+                    }
+                }
+                if (!ok) {
+                    LLAMA_LOG_ERROR("%s: qsa multi-sequence layout check FAILED (n_bid cached %d, rebuilt %d)\n", __func__, chk_n_bid, n_bid);
+                    GGML_ABORT("qsa layout check");
+                }
+            }
+
+            // several sequences and plain positions: keep the layout for in-place updates
+            if (lay_ms != nullptr) {
+                auto & L = *lay_ms;
+                L.valid = !ranked && !oor && !dup;
+                if (L.valid) {
+                    L.cells    = (const void *) &cells;
+                    L.n_kv     = n_kv;
+                    L.n_blocks = n_blocks;
+                    L.ratio    = r;
+
+                    L.pos.resize(n_kv);
+                    L.unpooled.clear();
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        L.pos[j] = cells.is_empty(j) ? -1 : cells.pos_get(j);
+                        if (L.pos[j] >= 0 && blk_of[j] < 0) {
+                            L.unpooled.push_back((int32_t) j);
+                        }
+                    }
+
+                    L.cell_grp = cell_grp;
+                    L.cell_blk .assign(cur_cell_blk,  cur_cell_blk  + n_kv);
+                    L.blk_cells.assign(cur_blk_cells, cur_blk_cells + r*n_blocks);
+                    L.blk_pos  .assign(dst_blk_pos,   dst_blk_pos   + 4*n_blocks);
+                    L.blk_of   = blk_of;
+                    L.bid_idx  = bid_idx;
+                    L.bid_cell = bid_cell;
+
+                    const size_t n_grp = grp_first.size();
+                    L.grp_seq.resize(n_grp);
+                    for (size_t g = 0; g < n_grp; ++g) {
+                        L.grp_seq[g] = cells.seq_get_all((uint32_t) grp_first[g]);
+                    }
+                    L.grp_slots = grp_slots;
+                    L.grp_first = grp_first;
+                    L.grp_slot0 = grp_slot0;
+                    L.grp_bid   = grp_bid;
+                    L.grp_next  = grp_next;
+                    L.grp_head  = grp_head;
                 }
             }
         }

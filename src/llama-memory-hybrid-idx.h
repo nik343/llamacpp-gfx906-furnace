@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
+#include "llama-kv-cells.h"
 
 #include <map>
 #include <memory>
@@ -109,8 +110,38 @@ public:
         std::vector<int32_t>  added;     // scratch
     };
 
+    // the same for a cell array holding several sequences (unified cache): a block is keyed on
+    // (position bucket, sequence set) and numbered when it fills. numbering order differs from the
+    // full rebuild (append instead of position order), which does not change any result: block scores
+    // are per block and the top-k runs per cell
+    struct qsa_layout_ms {
+        bool                  valid    = false;
+        const void          * cells    = nullptr;
+        int64_t               n_kv     = 0;
+        int64_t               n_blocks = 0;
+        int64_t               ratio    = 0;
+        std::vector<int32_t>  pos;       // [n_kv] cell positions, -1 for empty
+        std::vector<int32_t>  cell_grp;  // [n_kv] group of each cell, -1
+        std::vector<int32_t>  cell_blk;  // [n_kv]
+        std::vector<int32_t>  blk_of;    // [n_kv]
+        std::vector<int32_t>  blk_cells; // [ratio*n_blocks]
+        std::vector<int32_t>  blk_pos;   // [4*n_blocks]
+        std::vector<int32_t>  bid_idx;   // first position of each numbered block
+        std::vector<int32_t>  bid_cell;  // a cell of each numbered block
+        std::vector<llama_kv_cells::seq_set_t> grp_seq; // sequence set of each group
+        std::vector<uint64_t> grp_slots;
+        std::vector<int32_t>  grp_first;
+        std::vector<int32_t>  grp_slot0;
+        std::vector<int32_t>  grp_bid;
+        std::vector<int32_t>  grp_next;  // chain of the groups in one bucket
+        std::vector<int32_t>  grp_head;  // [n_blocks]
+        std::vector<int32_t>  unpooled;  // every cell in no full block
+        std::vector<int32_t>  added;     // scratch
+    };
+
 private:
-    mutable std::map<uint32_t, qsa_layout> qsa_layouts;
+    mutable std::map<uint32_t, qsa_layout>    qsa_layouts;
+    mutable std::map<uint32_t, qsa_layout_ms> qsa_layouts_ms;
 
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
