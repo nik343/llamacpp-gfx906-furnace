@@ -9,6 +9,9 @@
 //
 // usage: test-repack-bench [--check] [--filter s] [--routing wiki|bench|uniform]
 //        [--sigma f] [--dead f] [--ids-file f] [--dump f] [-r n] [-w n] [-t n] [--seed n]
+//        [--x3 n] [--ids-view]
+// --x3 n: dense src1 is [K, n, T] (several columns per slice, e.g. MTP eh_proj over hc streams)
+// --ids-view: MoE ids is a row-strided view of a wider tensor, as the model passes argsort output
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -37,6 +40,8 @@ struct params {
     int         warmup   = 5;
     int         tokens   = 2048;
     uint64_t    seed     = 1234;
+    int         x3       = 0;
+    bool        ids_view = false;
 };
 
 // ---------------------------------------------------------------------
@@ -241,7 +246,7 @@ static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buf
         print_routing(ids_host, s.n_expert);
     }
 
-    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead() * 2, nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * 24 + ggml_graph_overhead() * 2, nullptr, true };
     ggml_context * ctx_w   = ggml_init(ip);
     ggml_context * ctx_ref = ggml_init(ip);
     ggml_context * ctx_a   = ggml_init(ip);
@@ -254,11 +259,17 @@ static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buf
     ggml_tensor * out, * out_ref;
     if (moe) {
         x   = ggml_new_tensor_3d(ctx_a, GGML_TYPE_F32, s.K, s.bcast ? 1 : s.n_used, T);
-        ids = ggml_new_tensor_2d(ctx_a, GGML_TYPE_I32, s.n_used, T);
+        if (p.ids_view) {
+            ggml_tensor * ids_full = ggml_new_tensor_2d(ctx_a, GGML_TYPE_I32, 4 * s.n_used, T);
+            ids = ggml_view_2d(ctx_a, ids_full, s.n_used, T, ids_full->nb[1], 0);
+        } else {
+            ids = ggml_new_tensor_2d(ctx_a, GGML_TYPE_I32, s.n_used, T);
+        }
         out     = ggml_mul_mat_id(ctx_a, w,     x, ids);
         out_ref = ggml_mul_mat_id(ctx_a, w_ref, x, ids);
     } else {
-        x       = ggml_new_tensor_2d(ctx_a, GGML_TYPE_F32, s.K, T);
+        x       = p.x3 > 0 ? ggml_new_tensor_3d(ctx_a, GGML_TYPE_F32, s.K, p.x3, T)
+                           : ggml_new_tensor_2d(ctx_a, GGML_TYPE_F32, s.K, T);
         out     = ggml_mul_mat(ctx_a, w,     x);
         out_ref = ggml_mul_mat(ctx_a, w_ref, x);
     }
@@ -286,7 +297,13 @@ static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buf
         fill_normal(xf.data(), xf.size(), 1.0f, p.seed + 29);
         ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
         if (moe) {
-            ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+            if (p.ids_view) {
+                for (int64_t t = 0; t < T; t++) {
+                    ggml_backend_tensor_set(ids, ids_host.data() + t * s.n_used, t * ids->nb[1], s.n_used * sizeof(int32_t));
+                }
+            } else {
+                ggml_backend_tensor_set(ids, ids_host.data(), 0, ggml_nbytes(ids));
+            }
         }
     }
 
@@ -295,7 +312,7 @@ static bool run_shape(const params & p, ggml_backend_t backend, ggml_backend_buf
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
 
     const double us   = time_graph(backend, gf, p.warmup, p.reps);
-    const double macs = (double) s.K * s.N * T * (moe ? s.n_used : 1);
+    const double macs = (double) s.K * s.N * T * (moe ? s.n_used : std::max(1, p.x3));
 
     char tname[16];
     snprintf(tname, sizeof(tname), "%s", ggml_type_name(s.type));
@@ -453,9 +470,11 @@ int main(int argc, char ** argv) {
         else if (a == "-w")         { p.warmup = atoi(next()); }
         else if (a == "-t")         { p.tokens = atoi(next()); }
         else if (a == "--seed")     { p.seed = strtoull(next(), nullptr, 10); }
+        else if (a == "--x3")       { p.x3 = atoi(next()); }
+        else if (a == "--ids-view") { p.ids_view = true; }
         else {
             fprintf(stderr, "usage: %s [--check] [--filter s] [--routing wiki|bench|uniform] [--sigma f] [--dead f]\n"
-                            "       [--ids-file f] [--dump f] [-r reps] [-w warmup] [-t tokens] [--seed n]\n", argv[0]);
+                            "       [--ids-file f] [--dump f] [-r reps] [-w warmup] [-t tokens] [--seed n] [--x3 n] [--ids-view]\n", argv[0]);
             return 1;
         }
     }

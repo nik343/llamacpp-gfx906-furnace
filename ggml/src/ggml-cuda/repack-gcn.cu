@@ -3100,13 +3100,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const block_q8_1 * xq_all = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
 
-    // one column per slice (GDN output with several sequences): the slices are adjacent
-    // columns of xq_all and dst, so run them as one multi-column matvec
-    static const bool no_nc = getenv("GGML_CUDA_NO_Q8_NC") != nullptr;
-    if (!no_nc && src0->type == GGML_TYPE_Q8_0 && ne11 == 1 && ne13 == 1 && ne12 >= 2 && ne12 <= 16 &&
-        dst->nb[2] == (size_t) ne01 * sizeof(float)) {
+    // the weight is shared by every slice, and xq_all holds the slices as adjacent columns: when dst
+    // is contiguous too, run all of them as one matmul (GDN output with several sequences
+    // [K, 1, n_seq]; MTP eh_proj [K, n_hc, n_tokens] would otherwise launch once per token)
+    static const bool no_flat = getenv("GGML_CUDA_NO_REPACK_FLATTEN") != nullptr;
+    if (!no_flat && ne12 * ne13 > 1 &&
+        dst->nb[2] == (size_t) ne11 * dst->nb[1] && dst->nb[3] == (size_t) ne12 * dst->nb[2]) {
         ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq_all, (float *) dst->data,
-            ne00, ne01, ne12, x_stride, stream);
+            ne00, ne01, ne11 * ne12 * ne13, x_stride, stream);
         return;
     }
 
