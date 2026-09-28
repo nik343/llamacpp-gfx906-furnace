@@ -2360,7 +2360,7 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, params_base.ctx_checkpoints_async);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3562,7 +3562,10 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // each checkpoint costs a device drain and a state copy, and the split it forces
+                            // shortens the last prompt batch. append-only conversations (agents) only ever
+                            // resume from the tail one, so --ctx-checkpoints-tail-only drops the other
+                            const int checkpoint_offsets[] = {params_base.ctx_checkpoints_tail_only ? 4 : 4 + n_ubatch, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

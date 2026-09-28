@@ -16,7 +16,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -483,6 +485,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    for (auto & kv : state_async_events) {
+        if (kv.second) {
+            ggml_backend_event_free(kv.second);
+        }
+    }
+    state_async_events.clear();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2733,9 +2742,19 @@ public:
     llama_io_write_host(
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
+    // getter that enqueues the read on the tensor's device stream instead of copying now
+    using async_get_t = std::function<bool(ggml_tensor *, void *, size_t, size_t)>;
+
+    void set_async_get(async_get_t f) {
+        async_get = std::move(f);
+    }
+
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
+            if (async_get && async_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size)) {
+                continue;
+            }
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
     }
@@ -2779,6 +2798,8 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    async_get_t async_get;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3227,6 +3248,100 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
+    }
+}
+
+ggml_backend_t llama_context::backend_for_buffer(ggml_backend_buffer_t buffer) const {
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_buffer_is_host(buffer)) {
+        return backend_cpu;
+    }
+    for (ggml_backend_t b : backend_ptrs) {
+        if (ggml_backend_get_device(b) == dev) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
+// like state_seq_get_data into host memory, but without draining the devices first: every tensor read
+// is enqueued on its device's stream behind the queued work, so the state observed is exactly the one
+// after the last decode and later decodes queue behind the copy. dst must stay valid (and should be
+// pinned) until state_seq_async_wait(handle) returns
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t & handle) {
+    handle = -1;
+
+    std::vector<ggml_backend_t> used;
+    size_t n = 0;
+
+    try {
+        llama_io_write_host io(dst, size);
+        io.set_async_get([&](ggml_tensor * t, void * p, size_t off, size_t sz) -> bool {
+            ggml_backend_t b = backend_for_buffer(t->buffer);
+            if (b == nullptr) {
+                return false;
+            }
+            ggml_backend_tensor_get_async(b, t, p, off, sz);
+            if (std::find(used.begin(), used.end(), b) == used.end()) {
+                used.push_back(b);
+            }
+            return true;
+        });
+
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+
+        n = state_seq_write_data(io, seq_id, flags);
+        // the writer's destructor enqueues the reads
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+
+    // one ring slot per call; a slot reused while an old handle still points at it only makes that
+    // old wait a superset
+    const int32_t slot = state_async_next;
+    state_async_next = (state_async_next + 1) % (int32_t) state_async.size();
+
+    auto & entry = state_async[slot];
+    entry.events.clear();
+    for (ggml_backend_t b : used) {
+        if (b == backend_cpu) {
+            continue; // synchronous on the host
+        }
+        ggml_backend_event_t & ev = state_async_events[b];
+        if (ev == nullptr) {
+            ev = ggml_backend_event_new(ggml_backend_get_device(b));
+        }
+        if (ev != nullptr) {
+            ggml_backend_event_record(ev, b);
+            entry.events.push_back(ev);
+        } else {
+            ggml_backend_synchronize(b); // no events on this backend: drain it
+        }
+    }
+    handle = slot;
+
+    return n;
+}
+
+void llama_context::state_seq_async_wait(int32_t handle) {
+    if (handle < 0) {
+        for (auto & entry : state_async) {
+            for (ggml_backend_event_t ev : entry.events) {
+                ggml_backend_event_synchronize(ev);
+            }
+        }
+        return;
+    }
+    if (handle >= (int32_t) state_async.size()) {
+        return;
+    }
+    for (ggml_backend_event_t ev : state_async[handle].events) {
+        ggml_backend_event_synchronize(ev);
     }
 }
 
@@ -4358,6 +4473,19 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
+size_t llama_state_seq_get_data_async(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t * handle) {
+    int32_t h = -1;
+    const size_t n = ctx->state_seq_get_data_async(seq_id, dst, size, flags, h);
+    if (handle) {
+        *handle = h;
+    }
+    return n;
+}
+
+void llama_state_seq_async_wait(llama_context * ctx, int32_t handle) {
+    ctx->state_seq_async_wait(handle);
+}
+
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 

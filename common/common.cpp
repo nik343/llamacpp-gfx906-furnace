@@ -6,6 +6,8 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // staging API: llama_state_seq_get_data_async
+#include "ggml-backend.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -2260,6 +2262,7 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 void common_prompt_checkpoint::clear() {
+    async_wait();
     n_tokens = 0;
 
     pos_min = 0;
@@ -2279,19 +2282,123 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+common_state_bytes & common_state_bytes::operator=(common_state_bytes && o) noexcept {
+    if (this != &o) {
+        clear();
+        ptr = o.ptr; n = o.n; vec = std::move(o.vec); buf = o.buf;
+        o.ptr = nullptr; o.n = 0; o.buf = nullptr;
+        if (buf == nullptr && n > 0) {
+            ptr = vec.data();
+        }
+    }
+    return *this;
+}
+
+common_state_bytes & common_state_bytes::operator=(const common_state_bytes & o) {
+    if (this != &o) {
+        clear();
+        if (o.n > 0) {
+            resize(o.n, o.buf != nullptr);
+            memcpy(ptr, o.ptr, o.n);
+        }
+    }
+    return *this;
+}
+
+common_state_bytes::~common_state_bytes() {
+    clear();
+}
+
+common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & o) {
+    if (this != &o) {
+        async_wait();
+        const_cast<common_prompt_checkpoint &>(o).async_wait();
+        n_tokens  = o.n_tokens;
+        id_task   = o.id_task;
+        pos_min   = o.pos_min;
+        pos_max   = o.pos_max;
+        data_tgt  = o.data_tgt;
+        data_dft  = o.data_dft;
+        data_spec = o.data_spec;
+        async_ctx    = nullptr;
+        async_handle = -1;
+    }
+    return *this;
+}
+
+void common_state_bytes::clear() {
+    if (buf != nullptr) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t) buf);
+        buf = nullptr;
+    }
+    vec.clear();
+    vec.shrink_to_fit();
+    ptr = nullptr;
+    n   = 0;
+}
+
+void common_state_bytes::resize(size_t size, bool pinned) {
+    if (pinned) {
+        // keep a pinned buffer that is already large enough
+        if (buf != nullptr && ggml_backend_buffer_get_size((ggml_backend_buffer_t) buf) >= size) {
+            n = size;
+            return;
+        }
+        clear();
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        ggml_backend_buffer_t b = buft ? ggml_backend_buft_alloc_buffer(buft, size) : nullptr;
+        if (b != nullptr) {
+            buf = b;
+            ptr = (uint8_t *) ggml_backend_buffer_get_base(b);
+            n   = size;
+            return;
+        }
+    }
+    if (buf != nullptr) {
+        clear();
+    }
+    vec.resize(size);
+    ptr = vec.data();
+    n   = size;
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    async_wait();
+}
+
+void common_prompt_checkpoint::async_wait() {
+    if (async_ctx != nullptr && async_handle >= 0) {
+        llama_state_seq_async_wait(async_ctx, async_handle);
+    }
+    async_ctx    = nullptr;
+    async_handle = -1;
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        bool async) {
     if (ctx == nullptr) {
         return;
     }
 
+    async_wait();
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    data_tgt.resize(ckpt_size, async);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    size_t n = 0;
+    if (async) {
+        int32_t handle = -1;
+        n = llama_state_seq_get_data_async(ctx, data_tgt.data(), ckpt_size, seq_id, flags, &handle);
+        async_ctx    = ctx;
+        async_handle = handle;
+    } else {
+        n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }

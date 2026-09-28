@@ -127,6 +127,13 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
+// Sequence state copied into host memory without draining the devices: the reads are enqueued behind
+// the queued work on each device stream. dst must stay valid, and should be pinned host memory, until
+// llama_state_seq_async_wait(handle) returns (handle < 0 waits for every outstanding copy). Restoring
+// (llama_state_seq_set_data_ext) synchronizes the context and so also completes the copies.
+LLAMA_API size_t llama_state_seq_get_data_async(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t * handle);
+LLAMA_API void   llama_state_seq_async_wait(struct llama_context * ctx, int32_t handle);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

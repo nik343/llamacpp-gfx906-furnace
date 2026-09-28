@@ -1710,6 +1710,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-tail-only"},
+        "create only the context checkpoint 4 tokens before the end of a prompt, not the one a ubatch earlier "
+        "(one device drain and state copy less per prompt; conversations that only append resume from the tail one)",
+        [](common_params & params) {
+            params.ctx_checkpoints_tail_only = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_TAIL_ONLY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-async"},
+        "copy context checkpoint state on the device streams instead of draining the devices first "
+        "(the prompt batches after a checkpoint queue behind it)",
+        [](common_params & params) {
+            params.ctx_checkpoints_async = true;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

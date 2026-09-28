@@ -86,6 +86,10 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // state copy enqueued on the device streams; wait with state_seq_async_wait(handle), -1 = all
+    size_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t & handle);
+    void   state_seq_async_wait(int32_t handle);
+
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
@@ -423,6 +427,16 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    ggml_backend_t backend_for_buffer(ggml_backend_buffer_t buffer) const;
+
+    // in-flight asynchronous state copies: the events recorded behind each one
+    struct state_async_entry {
+        std::vector<ggml_backend_event_t> events;
+    };
+    std::array<state_async_entry, 32>              state_async;
+    int32_t                                        state_async_next = 0;
+    std::map<ggml_backend_t, ggml_backend_event_t> state_async_events;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

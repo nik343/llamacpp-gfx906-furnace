@@ -629,6 +629,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    ctx_checkpoints_tail_only = false; // only the checkpoint 4 tokens before the prompt end, not the one a ubatch earlier
+    bool    ctx_checkpoints_async     = false; // copy checkpoint state on the device streams instead of draining them
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string public_path   = "";                                                                         // NOLINT
@@ -1162,6 +1164,30 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// bytes for a state copy: pinned host memory when a device host buffer type is available (so an
+// asynchronous device -> host copy is really asynchronous), a plain vector otherwise
+struct common_state_bytes {
+    common_state_bytes() = default;
+    common_state_bytes(const common_state_bytes & o) { *this = o; }
+    common_state_bytes & operator=(const common_state_bytes & o);
+    common_state_bytes(common_state_bytes && o) noexcept { *this = std::move(o); }
+    common_state_bytes & operator=(common_state_bytes && o) noexcept;
+    ~common_state_bytes();
+
+    uint8_t * data() { return ptr; }
+    const uint8_t * data() const { return ptr; }
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    void resize(size_t size, bool pinned = false);
+    void clear();
+
+private:
+    uint8_t *            ptr = nullptr;
+    size_t               n   = 0;
+    std::vector<uint8_t> vec;         // unpinned storage
+    void *               buf = nullptr; // ggml_backend_buffer_t when pinned
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1171,8 +1197,23 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_bytes data_tgt;
+    common_state_bytes data_dft;
+
+    // an asynchronous copy of data_tgt still in flight (see update_tgt with async = true)
+    struct llama_context * async_ctx    = nullptr;
+    int32_t                async_handle = -1;
+
+    common_prompt_checkpoint() = default;
+    // a copy waits for the source's asynchronous copy first and owns plain, completed bytes
+    common_prompt_checkpoint(const common_prompt_checkpoint & o) { *this = o; }
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & o);
+    common_prompt_checkpoint(common_prompt_checkpoint &&) = default;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint &&) = default;
+    ~common_prompt_checkpoint();
+
+    // wait for the asynchronous copy, if any
+    void async_wait();
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1188,10 +1229,13 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
+    // async: copy without draining the devices (llama_state_seq_get_data_async); the checkpoint waits
+    // for it before its bytes are released or restored
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool async = false);
 
     void update_dft(
             llama_context * ctx,
