@@ -1713,6 +1713,45 @@ static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi(const f3
     }
 }
 
+// the grouped F32 matvec with several activation columns: the weights of a row are loaded once and
+// dotted with every column; dst is [rows, ncols] per matrix
+template <int NC>
+static __global__ void __launch_bounds__(256) gcn_f32_matvec_rows_multi_nc(const f32_multi_args args, const float * __restrict__ x, const int64_t sx1) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int ITERS = 2560 / 4 / warp_size;
+    const uint32_t gw   = blockIdx.x * (256 / warp_size) + threadIdx.x / warp_size;
+    const int      lane = threadIdx.x % warp_size;
+    const int t = gw >= args.start[2] ? 2 : (gw >= args.start[1] ? 1 : 0);
+    const uint32_t row = gw - args.start[t];
+    if (row >= args.rows[t]) {
+        return;
+    }
+    const float4 * a4 = reinterpret_cast<const float4 *>(args.A[t] + row * args.lda[t]);
+    float4 a[ITERS];
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        a[j] = a4[lane + j * warp_size];
+    }
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const float4 * x4 = reinterpret_cast<const float4 *>(x + c * sx1);
+        acc[c] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < ITERS; j++) {
+            const float4 b = x4[lane + j * warp_size];
+            acc[c] += a[j].x * b.x + a[j].y * b.y + a[j].z * b.z + a[j].w * b.w;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; c++) {
+        const float v = warp_reduce_sum<warp_size>(acc[c]);
+        if (lane == 0) {
+            args.y[t][(int64_t) c * args.rows[t] + row] = v;
+        }
+    }
+}
+
 // structural part (graph_optimize grouping; independent of the token count, see
 // ggml_cuda_repack_q8_multi_group)
 static bool ggml_cuda_f32_multi_group(const ggml_tensor * mm) {
@@ -1729,7 +1768,8 @@ static bool ggml_cuda_f32_multi_group(const ggml_tensor * mm) {
 static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
     const ggml_tensor * x = mm->src[1];
     return ggml_cuda_f32_multi_group(mm) &&
-        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(mm);
+        x->ne[1] >= 1 && x->ne[1] <= 16 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+        (x->ne[1] == 1 || ggml_is_contiguous(x)) && ggml_is_contiguous(mm);
 }
 #endif // defined(GGML_USE_HIP)
 
@@ -5288,7 +5328,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     args.start[k] = UINT32_MAX;
                 }
             }
-            gcn_f32_matvec_rows_multi<<<(waves + 3) / 4, 256, 0, cuda_ctx->stream()>>>(args, (const float *) node->src[1]->data);
+            const int64_t ncols = node->src[1]->ne[1];
+            if (ncols == 1) {
+                gcn_f32_matvec_rows_multi<<<(waves + 3) / 4, 256, 0, cuda_ctx->stream()>>>(args, (const float *) node->src[1]->data);
+            } else {
+                const float * xd  = (const float *) node->src[1]->data;
+                const int64_t sx1 = node->src[1]->nb[1] / sizeof(float);
+                const dim3 grid((waves + 3) / 4);
+                switch (ncols) {
+                    case 2:  gcn_f32_matvec_rows_multi_nc<2><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 3:  gcn_f32_matvec_rows_multi_nc<3><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 4:  gcn_f32_matvec_rows_multi_nc<4><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 5:  gcn_f32_matvec_rows_multi_nc<5><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 6:  gcn_f32_matvec_rows_multi_nc<6><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 7:  gcn_f32_matvec_rows_multi_nc<7><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 8:  gcn_f32_matvec_rows_multi_nc<8><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 9:  gcn_f32_matvec_rows_multi_nc<9><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 10: gcn_f32_matvec_rows_multi_nc<10><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 11: gcn_f32_matvec_rows_multi_nc<11><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 12: gcn_f32_matvec_rows_multi_nc<12><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 13: gcn_f32_matvec_rows_multi_nc<13><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 14: gcn_f32_matvec_rows_multi_nc<14><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    case 15: gcn_f32_matvec_rows_multi_nc<15><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                    default: gcn_f32_matvec_rows_multi_nc<16><<<grid, 256, 0, cuda_ctx->stream()>>>(args, xd, sx1); break;
+                }
+            }
             CUDA_CHECK(cudaGetLastError());
             return n - 1;
         }

@@ -3067,6 +3067,92 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_nc(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// The grouped launch (q8_multi_args) with several activation columns: mul_mat_vec_q8_0_repacked_nc per row,
+// the matrix chosen per wave
+template <int NC, int ITERS>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_multi_nc(
+        const q8_multi_args args, const block_q8_1 * __restrict__ xq, const uint32_t ne0, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    // the rows of the grouped matrices sit back to back; each wave resolves its own matrix
+    const uint32_t grow = blockIdx.x * 4 + threadIdx.x / 64;
+    const int      t    = grow >= args.start[2] ? 2 : (grow >= args.start[1] ? 1 : 0);
+    const uint32_t row  = grow - args.start[t];
+    const uint32_t ne1  = args.ne1[t];
+    if (row >= ne1) {
+        return;
+    }
+    const uint8_t * __restrict__ wbase = args.w[t];
+    float * __restrict__ y = args.y[t];
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const int lane = threadIdx.x % 64;
+
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+    const uint32_t n_half = n_blocks * 2;
+    if constexpr (ITERS > 0) {
+        int4     w[ITERS];
+        uint16_t db[ITERS];
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            const uint32_t sb = (hb < n_half ? hb : 0) >> 1, half = hb & 1;
+            w[j]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+            db[j] = d_plane[(size_t) row * nsp + sb];
+        }
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            if (hb >= n_half) {
+                break;
+            }
+            const uint32_t sb = hb >> 1, half = hb & 1;
+            const float    dw = __half2float(*reinterpret_cast<const __half *>(&db[j]));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+                const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+                int idot = 0;
+                idot = ggml_cuda_dp4a(w[j].x, a.x, idot); idot = ggml_cuda_dp4a(w[j].y, a.y, idot);
+                idot = ggml_cuda_dp4a(w[j].z, a.z, idot); idot = ggml_cuda_dp4a(w[j].w, a.w, idot);
+                acc[c] += dw * __low2float(xb->ds) * (float) idot;
+            }
+        }
+    } else
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const int4 w = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        const float    dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+            const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+            int idot = 0;
+            idot = ggml_cuda_dp4a(w.x, a.x, idot); idot = ggml_cuda_dp4a(w.y, a.y, idot);
+            idot = ggml_cuda_dp4a(w.z, a.z, idot); idot = ggml_cuda_dp4a(w.w, a.w, idot);
+            acc[c] += dw * __low2float(xb->ds) * (float) idot;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<64>(acc[c]);
+        if (lane == 0) {
+            y[(size_t) c * ne1 + row] = v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(args, xq, ne0, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
@@ -3362,8 +3448,11 @@ void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const gg
             continue;
         }
         const ggml_tensor * x = n->src[1];
+        // several columns read the flat blocks as [ne1][ne0/32], which is the consumer's layout only when
+        // ne0 needs no row padding
         consumer = repack_view_root(x) == repack_view_root(t) && x->data == t->data && ggml_is_contiguous(x) &&
-            x->type == GGML_TYPE_F32 && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[0] <= ggml_nelements(t);
+            x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
+            (x->ne[1] == 1 || x->ne[0] % MATRIX_ROW_PADDING == 0) && x->ne[0]*x->ne[1] <= ggml_nelements(t);
     }
     bool capturing = false;
     if (!consumer || !repack_route_cache_usable(ctx, ctx.stream(), &capturing)) {
@@ -3408,12 +3497,15 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
         return (const block_q8_1 *) p;
     }
     ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
-    const bool single_col = src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1);
+    // an emitted (flat) entry serves one column, or several when ne0 needs no row padding (then the flat
+    // blocks are exactly [ne1][ne10_padded/32])
+    const bool flat_ok = src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+        (src1->ne[1] == 1 || ne10_padded == src1->ne[0]);
     for (auto & e : rc.xqc) {
         if (e.gen != ctx.graph_gen || e.data != src1->data) {
             continue;
         }
-        if (e.flat_n > 0 ? (single_col && src1->ne[0] <= e.flat_n) :
+        if (e.flat_n > 0 ? (flat_ok && src1->ne[0]*src1->ne[1] <= e.flat_n) :
                 (memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0)) {
             return (const block_q8_1 *) e.buf;
         }
@@ -4012,7 +4104,8 @@ bool ggml_cuda_repack_q8_multi_group(const ggml_tensor * mm) {
 bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm) {
     const ggml_tensor * x = mm->src[1];
     return ggml_cuda_repack_q8_multi_group(mm) &&
-        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(mm);
+        x->ne[1] >= 1 && x->ne[1] <= 16 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+        (x->ne[1] == 1 || ggml_is_contiguous(x)) && ggml_is_contiguous(mm);
 }
 
 void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n) {
@@ -4036,7 +4129,41 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
             args.start[i] = UINT32_MAX;
         }
     }
-    mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
+    const int64_t ne11 = src1->ne[1];
+    if (ne11 == 1) {
+        mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // several columns (speculative verify, several sequences): the nc kernel over the grouped rows
+    const int64_t x_stride = ne10_padded / QK8_1;
+    const int64_t n_it     = (2*(ne00/32) + 63) / 64;
+    const dim3 grid((rows + 3) / 4);
+    auto launch = [&](auto nc) {
+        constexpr int NC = decltype(nc)::value;
+        if (n_it == 3) {
+            mul_mat_vec_q8_0_repacked_multi_nc<NC, 3><<<grid, 256, 0, stream>>>(args, xq, (uint32_t) ne00, (uint32_t) x_stride);
+        } else {
+            mul_mat_vec_q8_0_repacked_multi_nc<NC, 0><<<grid, 256, 0, stream>>>(args, xq, (uint32_t) ne00, (uint32_t) x_stride);
+        }
+    };
+    switch (ne11) {
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 3:  launch(std::integral_constant<int, 3>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 5:  launch(std::integral_constant<int, 5>{}); break;
+        case 6:  launch(std::integral_constant<int, 6>{}); break;
+        case 7:  launch(std::integral_constant<int, 7>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        case 9:  launch(std::integral_constant<int, 9>{}); break;
+        case 10: launch(std::integral_constant<int, 10>{}); break;
+        case 11: launch(std::integral_constant<int, 11>{}); break;
+        case 12: launch(std::integral_constant<int, 12>{}); break;
+        case 13: launch(std::integral_constant<int, 13>{}); break;
+        case 14: launch(std::integral_constant<int, 14>{}); break;
+        case 15: launch(std::integral_constant<int, 15>{}); break;
+        default: launch(std::integral_constant<int, 16>{}); break;
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -4054,7 +4181,8 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
         const float * __restrict__ lo, const float scale, const float bias,
         const uint8_t * __restrict__ wbase, const uint32_t ne1,
         const float * __restrict__ xn, const int64_t sx1,
-        const float pre_scale, float * __restrict__ dst, block_q8_1 * __restrict__ yq, const int64_t n_embd) {
+        const float pre_scale, float * __restrict__ dst, block_q8_1 * __restrict__ yq, const int64_t n_embd,
+        const int64_t sx2) {
 #if defined(GGML_USE_HIP) && defined(GCN)
     constexpr int ROWS = HC_UP_HC*HC_UP_D;
     __shared__ block_q8_1 aq[HC_UP_NB];
@@ -4062,6 +4190,14 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
     __shared__ float      gate[ROWS];
 
     const int t = threadIdx.x;
+    // blockIdx.y is the token: its own lo row, xn slab, dst row and q8 row
+    {
+        const int it = blockIdx.y;
+        lo  += (int64_t) it*HC_UP_K;
+        xn  += (int64_t) it*sx2;
+        dst += (int64_t) it*n_embd;
+        yq   = yq ? yq + (int64_t) it*(n_embd/QK8_1) : yq;
+    }
 
     const int4     * qs4     = reinterpret_cast<const int4 *>(wbase);
     const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * HC_UP_NB * 32);
@@ -4151,7 +4287,7 @@ static __global__ void __launch_bounds__(256) hc_up_pre_f32(
         }
     }
 #else
-    GGML_UNUSED_VARS(lo, scale, bias, wbase, ne1, xn, sx1, pre_scale, dst, yq, n_embd);
+    GGML_UNUSED_VARS(lo, scale, bias, wbase, ne1, xn, sx1, pre_scale, dst, yq, n_embd, sx2);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -4167,10 +4303,11 @@ bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu,
     }
     const bool gated = ggml_get_op_params_i32(pre, 1) != 0;
     const int64_t n_embd = pre->ne[0];
-    return gated && lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) && ggml_nelements(lo) == HC_UP_K &&
-        up->type == GGML_TYPE_F32 && ggml_nelements(up) == w->ne[1] && xn->type == GGML_TYPE_F32 &&
-        xn->ne[0] == n_embd && xn->ne[1] == HC_UP_HC && xn->ne[2] == 1 && xn->nb[0] == sizeof(float) &&
-        w->ne[1] == HC_UP_HC*n_embd && n_embd % HC_UP_D == 0 && pre->ne[1] == 1 && pre->ne[2] == 1 &&
+    const int64_t n_tok = pre->ne[1]; // one block row per token (speculative verify, several sequences)
+    return gated && n_tok >= 1 && n_tok <= 16 && lo->type == GGML_TYPE_F32 && ggml_is_contiguous(lo) && ggml_nelements(lo) == HC_UP_K*n_tok &&
+        up->type == GGML_TYPE_F32 && ggml_nelements(up) == w->ne[1]*n_tok && xn->type == GGML_TYPE_F32 &&
+        xn->ne[0] == n_embd && xn->ne[1] == HC_UP_HC && xn->ne[2] == n_tok && xn->ne[3] == 1 && xn->nb[0] == sizeof(float) &&
+        w->ne[1] == HC_UP_HC*n_embd && n_embd % HC_UP_D == 0 && pre->ne[2] == 1 && pre->ne[3] == 1 &&
         pre->type == GGML_TYPE_F32 && ggml_is_contiguous(pre) && pre->src[1]->ne[1] == HC_UP_HC;
 }
 
@@ -4184,8 +4321,9 @@ void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * sc
 
     const ggml_tensor * xn = pre->src[0];
     const int64_t n_embd = pre->ne[0];
-    hc_up_pre_f32<<<n_embd / HC_UP_D, 256, 0, ctx.stream()>>>(
+    hc_up_pre_f32<<<dim3(n_embd / HC_UP_D, pre->ne[1], 1), 256, 0, ctx.stream()>>>(
         (const float *) scale->src[0]->data, s, b, (const uint8_t *) up->src[0]->data, (uint32_t) up->src[0]->ne[1],
-        (const float *) xn->data, xn->nb[1] / sizeof(float), pre_scale, (float *) pre->data, (block_q8_1 *) yq, n_embd);
+        (const float *) xn->data, xn->nb[1] / sizeof(float), pre_scale, (float *) pre->data, (block_q8_1 *) yq, n_embd,
+        xn->nb[2] / sizeof(float));
     CUDA_CHECK(cudaGetLastError());
 }
