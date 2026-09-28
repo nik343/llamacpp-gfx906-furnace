@@ -1,4 +1,4 @@
-# llama-cpp-vega-retune
+# llama-gfx906-furnace
 
 A retune of llama.cpp for AMD Vega 20 (gfx906: Instinct MI50/MI60,
 Radeon VII / Pro VII). Adds a GCN weight-repacking GPU buffer type and
@@ -11,6 +11,8 @@ Everything is measured on real hardware with cold-start A/B discipline
 and validated against the canonical paths (KL divergence against an
 unfused single-token baseline, test-backend-ops cases, a single-op
 reference check for the repacked kernels).
+
+Recently update for Qwen-3.8-flash-next (9/28)
 
 Branches:
 
