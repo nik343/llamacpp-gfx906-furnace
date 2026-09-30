@@ -3007,6 +3007,16 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // a verify batch costs every slot its draft tokens' matvec and expert work, so with several slots
+        // generating the aggregate is higher without drafts (4x MI50, MTP n2: 4 slots 64 vs 91 t/s,
+        // 6 slots 57 vs 102); --spec-draft-max-slots drafts only while few slots are generating
+        int n_generating = 0;
+        iterate(slots, [&](server_slot & slot) {
+            n_generating += slot.state == SLOT_STATE_GENERATING;
+        });
+        const int  draft_max_slots = params_base.speculative.draft.max_slots;
+        const bool draft_allowed   = draft_max_slots <= 0 || n_generating <= draft_max_slots;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3028,7 +3038,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = draft_allowed ? slot.get_n_draft_max() : 0;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
