@@ -472,11 +472,14 @@ static void launch_gated_delta_net(
 
 #if defined(GGML_USE_HIP)
     if constexpr (!KDA) {
-        static const int cpw_env = getenv("GGML_CUDA_GDN_CPW") ? atoi(getenv("GGML_CUDA_GDN_CPW")) : 2;
-        if (S_v == 128 && warp_size == 64 && n_tokens == 1 && (cpw_env == 2 || cpw_env == 4)) {
-            const dim3 grid(H, n_seqs, S_v / (num_warps * cpw_env));
+        // 4 columns per wave scales better with the sequence count (48 heads x 128, 6 seqs: 122 vs 173 us),
+        // one sequence is slightly faster with 2; GGML_CUDA_GDN_CPW=2|4 forces one
+        static const int cpw_env = getenv("GGML_CUDA_GDN_CPW") ? atoi(getenv("GGML_CUDA_GDN_CPW")) : 0;
+        const int cpw = cpw_env ? cpw_env : (n_seqs >= 2 ? 4 : 2);
+        if (S_v == 128 && warp_size == 64 && n_tokens == 1 && (cpw == 2 || cpw == 4)) {
+            const dim3 grid(H, n_seqs, S_v / (num_warps * cpw));
             const dim3 block(64, num_warps, 1);
-            if (cpw_env == 4) {
+            if (cpw == 4) {
                 gated_delta_net_cpw<4, keep_rs_t><<<grid, block, 0, stream>>>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,
                     state_slot_stride, K, state_rows, state_row_stride);
