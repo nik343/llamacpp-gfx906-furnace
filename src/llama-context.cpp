@@ -825,6 +825,12 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
+    // pinned staging for the async graph inputs, allocated at load rather than inside the first prompt
+    if (cparams.pipeline_parallel) {
+        ggml_backend_sched_set_input_async(sched.get(), true);
+        ggml_backend_sched_set_input_async(sched.get(), false);
+    }
+
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
@@ -1570,8 +1576,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // async graph-input copies let the devices of a layer split overlap consecutive ubatches of a prompt;
     // single-token and verify steps run the devices one after another anyway and decode measured slower
-    // with them (tg64 49 -> 42 t/s, with high variance), so those keep the synchronous copies
-    ggml_backend_sched_set_input_async(sched.get(), ubatch.n_tokens >= 64);
+    // with them (tg64 49 -> 42 t/s, with high variance), so those keep the synchronous copies.
+    // LLAMA_ASYNC_INPUT_MIN_TOKENS sets the ubatch size from which they are used (64)
+    static const uint32_t async_min = getenv("LLAMA_ASYNC_INPUT_MIN_TOKENS") ? (uint32_t) atoi(getenv("LLAMA_ASYNC_INPUT_MIN_TOKENS")) : 64;
+    ggml_backend_sched_set_input_async(sched.get(), ubatch.n_tokens >= async_min);
 
     const int64_t t_gc0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2089,6 +2097,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         turboprefill.stage_for_ubatch(ubatch.n_tokens, cparams.n_ubatch);
+
+        // a reallocation earlier in this batch (a multi-sequence decode ubatch ahead of the prompt tokens)
+        // re-planned the allocator for that shape; every prompt ubatch after it would reallocate again
+        if (ubatch.n_tokens >= 64) {
+            sched_restore_worst_case();
+        }
 
         const int64_t t_ub0 = ggml_time_us();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);

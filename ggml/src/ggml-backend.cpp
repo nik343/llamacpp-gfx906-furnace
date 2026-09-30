@@ -889,6 +889,7 @@ struct ggml_backend_sched {
     bool    input_stage_failed[GGML_SCHED_MAX_BACKENDS];
     bool    input_async;     // async input copies allowed for the current compute
     bool    input_async_req; // requested by the user, ggml_backend_sched_set_input_async()
+    bool    input_stage_init;
     int64_t n_input_sync;    // graph inputs that still took the synchronous path
 };
 
@@ -1714,36 +1715,57 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // devices ran one after another. The region of a copy slot is reused n_copies graphs later, after the
 // event recorded behind that graph's copies. GGML_SCHED_SYNC_INPUTS=1 restores the synchronous copies;
 // GGML_SCHED_INPUT_STAGE_MB sets the region size (default 256), larger inputs stay synchronous.
+// allocates the staging of every copy slot of a device backend once; pinned memory only, since the
+// runtime stages a copy from pageable memory synchronously (and pins it behind our back)
+static void ggml_backend_sched_input_stage_alloc(ggml_backend_sched_t sched, int backend_id) {
+    static const size_t stage_size = (getenv("GGML_SCHED_INPUT_STAGE_MB") ? (size_t) atoll(getenv("GGML_SCHED_INPUT_STAGE_MB")) : 256) << 20;
+
+    static const bool disabled = getenv("GGML_SCHED_SYNC_INPUTS") != nullptr;
+
+    ggml_backend_t     backend = sched->backends[backend_id];
+    ggml_backend_dev_t dev     = ggml_backend_get_device(backend);
+    if (disabled || backend->iface.set_tensor_async == NULL || dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        sched->input_stage_failed[backend_id] = true;
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+    for (int c = 0; c < sched->n_copies; c++) {
+        ggml_backend_buffer_t buf = buft && sched->events[backend_id][c] ? ggml_backend_buft_alloc_buffer(buft, stage_size) : NULL;
+        // a host buffer type may fall back to a plain CPU buffer when pinning fails
+        if (buf != NULL && ggml_backend_buffer_get_type(buf) != buft) {
+            ggml_backend_buffer_free(buf);
+            buf = NULL;
+        }
+        if (buf == NULL) {
+            GGML_LOG_WARN("%s: no pinned staging for %s, graph inputs stay synchronous\n", __func__, ggml_backend_name(backend));
+            for (int i = 0; i < c; i++) {
+                ggml_backend_buffer_free(sched->input_stage[backend_id][i]);
+                sched->input_stage[backend_id][i] = NULL;
+            }
+            sched->input_stage_failed[backend_id] = true;
+            return;
+        }
+        sched->input_stage[backend_id][c] = buf;
+    }
+}
+
 static bool ggml_backend_sched_copy_input_async(ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
     static const bool disabled = getenv("GGML_SCHED_SYNC_INPUTS") != nullptr;
-    static const size_t stage_size = (getenv("GGML_SCHED_INPUT_STAGE_MB") ? (size_t) atoll(getenv("GGML_SCHED_INPUT_STAGE_MB")) : 256) << 20;
 
     ggml_backend_t backend = sched->backends[backend_id];
     const int      c       = sched->cur_copy;
 
-    if (disabled || !sched->input_async || backend->iface.set_tensor_async == NULL ||
-        sched->events[backend_id][c] == NULL || sched->input_stage_failed[backend_id]) {
+    if (disabled || !sched->input_async || sched->input_stage_failed[backend_id] || sched->input_stage[backend_id][c] == NULL) {
         return false;
     }
 
     ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
-    ggml_backend_dev_t    dev     = ggml_backend_get_device(backend);
-    if (src_buf == NULL || !ggml_backend_buffer_is_host(src_buf) || dev == NULL ||
-        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+    if (src_buf == NULL || !ggml_backend_buffer_is_host(src_buf)) {
         return false;
     }
 
-    ggml_backend_buffer_t & stage = sched->input_stage[backend_id][c];
-    if (stage == NULL) {
-        // allocated once and never resized or freed while the scheduler lives
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
-        stage = buft ? ggml_backend_buft_alloc_buffer(buft, stage_size) : NULL;
-        if (stage == NULL) {
-            GGML_LOG_WARN("%s: no pinned staging for %s, graph inputs stay synchronous\n", __func__, ggml_backend_name(backend));
-            sched->input_stage_failed[backend_id] = true;
-            return false;
-        }
-    }
+    ggml_backend_buffer_t stage = sched->input_stage[backend_id][c];
 
     const size_t nbytes = ggml_nbytes(input);
     size_t &     off    = sched->input_stage_off[backend_id];
@@ -2685,6 +2707,13 @@ int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_input_async(ggml_backend_sched_t sched, bool enable) {
     GGML_ASSERT(sched);
     sched->input_async_req = enable;
+    // the pinned staging is allocated at the first request, outside the split loop
+    if (enable && !sched->input_stage_init) {
+        sched->input_stage_init = true;
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_sched_input_stage_alloc(sched, b);
+        }
+    }
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
