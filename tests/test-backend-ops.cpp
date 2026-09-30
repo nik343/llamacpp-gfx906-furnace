@@ -11423,6 +11423,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp decode router top-k (512 experts, 10 used, softmax + norm)
     test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
 
+    // qwen4exp GDN decode state update (48 heads x 128, state gathered from the cache) vs sequence count,
+    // plus the 3-token verify shape
+    for (int64_t n_seqs : {1, 2, 4, 6, 8}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, n_seqs, 1, false, false, 1, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 3, 1, 1, false, false, 1, true));
+
     // qwen4exp GDN prefill at ubatch 2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
 
