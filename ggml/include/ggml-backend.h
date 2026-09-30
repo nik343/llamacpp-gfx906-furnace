@@ -331,6 +331,10 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_cur_copy(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_next_copy(ggml_backend_sched_t sched);
+    // number of graph reallocations in ggml_backend_sched_alloc_graph; each one synchronizes all backends
+    GGML_API int64_t              ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched);
+    // copy graph inputs to the devices asynchronously from pinned staging (default: off)
+    GGML_API void                 ggml_backend_sched_set_input_async(ggml_backend_sched_t sched, bool enable);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);

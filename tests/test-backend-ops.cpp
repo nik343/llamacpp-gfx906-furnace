@@ -11174,6 +11174,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    // Qwen QSA prompt ubatches: rows go through the sparse decode path in blocks once n_kv >= 3*n_sel
+    for (int nb : {100, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+    }
 
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -11322,6 +11326,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 5, 2, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 9, 1, 1, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 1, true));
+    for (int64_t n_seqs : {2, 4, 6}) {
+        for (int64_t K : {1, 3}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, n_seqs, 1, false, false, K, true));
+        }
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 33, 2, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 3, 3, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 3, 2, 1, false, false, 4));
@@ -11422,6 +11431,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen4exp decode router top-k (512 experts, 10 used, softmax + norm)
     test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+
+    // qwen4exp GDN decode state update (48 heads x 128, state gathered from the cache) vs sequence count,
+    // plus the 3-token verify shape
+    for (int64_t n_seqs : {1, 2, 4, 6, 8}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, n_seqs, 1, false, false, 1, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 3, 1, 1, false, false, 1, true));
 
     // qwen4exp GDN prefill at ubatch 2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));

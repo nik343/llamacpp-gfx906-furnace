@@ -636,6 +636,48 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// A graph that does not fit the reserved plan makes the scheduler re-plan the allocator for that graph
+// alone (and synchronize every backend). After that, every larger graph reallocates again: the inputs of
+// a prompt grow with n_kv each ubatch, so a pipelined prompt drains once per ubatch. Multi-sequence decode
+// graphs whose recurrent range covers other sequences need extra state-copy rows that the worst-case
+// reserve does not have, so any multi-slot decode starts this. Re-plan with the worst-case graph once
+// after such a reallocation. LLAMA_NO_REALLOC_RESTORE=1 disables it.
+void llama_context::sched_restore_worst_case() {
+    static const bool disabled = getenv("LLAMA_NO_REALLOC_RESTORE") != nullptr;
+    if (disabled || !sched || !memory || sched_need_reserve) {
+        return;
+    }
+
+    const int64_t n_realloc = ggml_backend_sched_get_n_realloc(sched.get());
+    if (n_realloc == sched_n_realloc_seen) {
+        return;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    // the reallocation already drained every backend; wait for anything queued since
+    ggml_backend_sched_synchronize(sched.get());
+
+    const auto mctx = memory->init_full();
+    if (!mctx) {
+        LLAMA_LOG_ERROR("%s: failed to initialize memory context\n", __func__);
+        return;
+    }
+
+    const uint32_t n_seqs        = cparams.n_seq_max;
+    const uint32_t n_tokens      = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+
+    if (!graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get())) {
+        LLAMA_LOG_ERROR("%s: failed to reserve the worst-case graph\n", __func__);
+    }
+
+    sched_n_realloc_seen = ggml_backend_sched_get_n_realloc(sched.get());
+
+    LLAMA_LOG_INFO("%s: restored the worst-case plan after %lld reallocations in %.1f ms\n", __func__,
+            (long long) n_realloc, (ggml_time_us() - t_start_us)/1000.0);
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -663,6 +705,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched_n_realloc_seen = 0;
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -781,6 +824,12 @@ void llama_context::sched_reserve() {
     }
 
     const int64_t t_end_us = ggml_time_us();
+
+    // pinned staging for the async graph inputs, allocated at load rather than inside the first prompt
+    if (cparams.pipeline_parallel) {
+        ggml_backend_sched_set_input_async(sched.get(), true);
+        ggml_backend_sched_set_input_async(sched.get(), false);
+    }
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -1525,6 +1574,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // async graph-input copies let the devices of a layer split overlap consecutive ubatches of a prompt;
+    // single-token and verify steps run the devices one after another anyway and decode measured slower
+    // with them (tg64 49 -> 42 t/s, with high variance), so those keep the synchronous copies.
+    // LLAMA_ASYNC_INPUT_MIN_TOKENS sets the ubatch size from which they are used (64)
+    static const uint32_t async_min = getenv("LLAMA_ASYNC_INPUT_MIN_TOKENS") ? (uint32_t) atoi(getenv("LLAMA_ASYNC_INPUT_MIN_TOKENS")) : 64;
+    ggml_backend_sched_set_input_async(sched.get(), ubatch.n_tokens >= async_min);
+
     const int64_t t_gc0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (decode_time_log()) {
@@ -1840,6 +1896,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // prompt-sized batches get the worst-case allocator plan back, see sched_restore_worst_case()
+    if (batch_inp.n_tokens >= 64) {
+        sched_restore_worst_case();
+    }
+
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -2036,6 +2097,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         turboprefill.stage_for_ubatch(ubatch.n_tokens, cparams.n_ubatch);
+
+        // a reallocation earlier in this batch (a multi-sequence decode ubatch ahead of the prompt tokens)
+        // re-planned the allocator for that shape; every prompt ubatch after it would reallocate again
+        if (ubatch.n_tokens >= 64) {
+            sched_restore_worst_case();
+        }
 
         const int64_t t_ub0 = ggml_time_us();
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
