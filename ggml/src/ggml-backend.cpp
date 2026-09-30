@@ -1713,10 +1713,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 // the previous device's output, so the host blocked for a whole pipeline stage at every split and the
 // devices ran one after another. The region of a copy slot is reused n_copies graphs later, after the
 // event recorded behind that graph's copies. GGML_SCHED_SYNC_INPUTS=1 restores the synchronous copies;
-// GGML_SCHED_INPUT_STAGE_MB sets the region size (default 128), larger inputs stay synchronous.
+// GGML_SCHED_INPUT_STAGE_MB sets the region size (default 256), larger inputs stay synchronous.
 static bool ggml_backend_sched_copy_input_async(ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
     static const bool disabled = getenv("GGML_SCHED_SYNC_INPUTS") != nullptr;
-    static const size_t stage_size = (getenv("GGML_SCHED_INPUT_STAGE_MB") ? (size_t) atoll(getenv("GGML_SCHED_INPUT_STAGE_MB")) : 128) << 20;
+    static const size_t stage_size = (getenv("GGML_SCHED_INPUT_STAGE_MB") ? (size_t) atoll(getenv("GGML_SCHED_INPUT_STAGE_MB")) : 256) << 20;
 
     ggml_backend_t backend = sched->backends[backend_id];
     const int      c       = sched->cur_copy;
