@@ -1984,9 +1984,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         {
             static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
             if (sched_time) {
-                GGML_LOG_INFO("sched split %d %s: n_inputs %d, prev-wait %.1f ms, inputs %.1f ms, compute-enqueue %.1f ms, total %.1f ms (copy %d)\n",
+                GGML_LOG_INFO("sched split %d %s: n_inputs %d, prev-wait %.1f ms, inputs %.1f ms, compute-enqueue %.1f ms, total %.1f ms (copy %d, sync inputs %lld)\n",
                         split_id, ggml_backend_name(split_backend), split->n_inputs, t_prev_wait / 1000.0, t_inputs / 1000.0,
-                        t_compute / 1000.0, (ggml_time_us() - t_split0) / 1000.0, sched->cur_copy);
+                        t_compute / 1000.0, (ggml_time_us() - t_split0) / 1000.0, sched->cur_copy, (long long) sched->n_input_sync);
             }
         }
     }
