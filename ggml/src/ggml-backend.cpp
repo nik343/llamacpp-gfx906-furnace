@@ -878,6 +878,9 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // graph reallocations done by alloc_splits (each one synchronizes every backend)
+    int64_t n_realloc;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1679,6 +1682,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        sched->n_realloc++;
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
@@ -2596,6 +2600,11 @@ int ggml_backend_sched_get_cur_copy(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_next_copy(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->next_copy;
+}
+
+int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_realloc;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

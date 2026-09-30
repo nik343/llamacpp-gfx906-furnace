@@ -55,6 +55,7 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void sched_restore_worst_case();
 
     void synchronize();
 
@@ -372,6 +373,9 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // sched reallocation count at the last worst-case reserve, see sched_restore_worst_case()
+    int64_t sched_n_realloc_seen = 0;
 
     struct llama_turboprefill_state {
         bool enabled = false;
