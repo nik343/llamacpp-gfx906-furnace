@@ -942,6 +942,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // async checkpoint reads may still be queued on the target context; the slots are destroyed after it
+        for (auto & slot : slots) {
+            for (auto & ckpt : slot.prompt.checkpoints) {
+                ckpt.async_wait();
+            }
+            slot.spec_ckpt.async_wait();
+        }
+
         spec.reset();
         spec_init.reset();
 
