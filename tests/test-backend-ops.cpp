@@ -11326,6 +11326,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 5, 2, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 9, 1, 1, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 1, true));
+    for (int64_t n_seqs : {2, 4, 6}) {
+        for (int64_t K : {1, 3}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, n_seqs, 1, false, false, K, true));
+        }
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 33, 2, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 3, 3, 1, false, false, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 3, 2, 1, false, false, 4));
