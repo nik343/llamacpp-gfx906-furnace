@@ -561,7 +561,17 @@ bool ggml_cuda_gdn_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_
             }
         }
     }
-    return user != nullptr && ggml_nelements(user->src[5]) == ggml_nelements(gr);
+    if (user == nullptr || ggml_nelements(user->src[5]) != ggml_nelements(gr)) {
+        return false;
+    }
+    // The fused cache write-back stores sequence a's state into row kv_head + a in the same launch that
+    // reads sequence b's state from row state_rows[b]. Fresh sequences all read the zero row rs_z, which
+    // is one of their destination rows, so a prompt ubatch with several sequences read a state another
+    // block was overwriting (multi-sequence batches were not reproducible). Decode ubatches read each
+    // sequence's own row (or a rollback snapshot), so they keep the elision.
+    const int64_t n_seq_tokens = user->src[2]->ne[2];
+    const int64_t n_seqs       = user->src[2]->ne[3];
+    return n_seqs == 1 || n_seq_tokens == 1;
 }
 
 static void ggml_cuda_op_gated_delta_net_impl(
