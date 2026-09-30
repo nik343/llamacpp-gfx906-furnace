@@ -3022,7 +3022,9 @@ private:
         iterate(slots, [&](server_slot & slot) {
             n_generating += slot.state == SLOT_STATE_GENERATING;
         });
-        const int  draft_max_slots = params_base.speculative.draft.max_slots;
+        // LLAMA_SPEC_MAX_GEN is the same limit as the env of the GLM rune build (the flag wins when set)
+        static const int spec_max_gen = getenv("LLAMA_SPEC_MAX_GEN") ? atoi(getenv("LLAMA_SPEC_MAX_GEN")) : 0;
+        const int  draft_max_slots = params_base.speculative.draft.max_slots > 0 ? params_base.speculative.draft.max_slots : spec_max_gen;
         const bool draft_allowed   = draft_max_slots <= 0 || n_generating <= draft_max_slots;
 
         // determine which slots are generating and drafting
