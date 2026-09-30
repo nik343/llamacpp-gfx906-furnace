@@ -881,6 +881,14 @@ struct ggml_backend_sched {
 
     // graph reallocations done by alloc_splits (each one synchronizes every backend)
     int64_t n_realloc;
+
+    // pinned host staging for the graph inputs copied to each backend, one region per copy slot,
+    // see ggml_backend_sched_copy_input_async()
+    ggml_backend_buffer_t input_stage[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    size_t  input_stage_off[GGML_SCHED_MAX_BACKENDS];
+    bool    input_stage_failed[GGML_SCHED_MAX_BACKENDS];
+    bool    input_async;     // async input copies allowed for the current compute
+    int64_t n_input_sync;    // graph inputs that still took the synchronous path
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1698,10 +1706,73 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 // TurboPrefill can defer full ubatches, then replay them sequentially from saved slot state.
+// Graph inputs go to each backend with an async H2D on the backend's own stream, from pinned staging owned
+// by the scheduler (one region per copy slot, filled from the start at every compute). A host-synchronous
+// copy waits for everything already queued on the device: with a layer split that includes the wait on
+// the previous device's output, so the host blocked for a whole pipeline stage at every split and the
+// devices ran one after another. The region of a copy slot is reused n_copies graphs later, after the
+// event recorded behind that graph's copies. GGML_SCHED_SYNC_INPUTS=1 restores the synchronous copies;
+// GGML_SCHED_INPUT_STAGE_MB sets the region size (default 128), larger inputs stay synchronous.
+static bool ggml_backend_sched_copy_input_async(ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+    static const bool disabled = getenv("GGML_SCHED_SYNC_INPUTS") != nullptr;
+    static const size_t stage_size = (getenv("GGML_SCHED_INPUT_STAGE_MB") ? (size_t) atoll(getenv("GGML_SCHED_INPUT_STAGE_MB")) : 128) << 20;
+
+    ggml_backend_t backend = sched->backends[backend_id];
+    const int      c       = sched->cur_copy;
+
+    if (disabled || !sched->input_async || backend->iface.set_tensor_async == NULL ||
+        sched->events[backend_id][c] == NULL || sched->input_stage_failed[backend_id]) {
+        return false;
+    }
+
+    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
+    ggml_backend_dev_t    dev     = ggml_backend_get_device(backend);
+    if (src_buf == NULL || !ggml_backend_buffer_is_host(src_buf) || dev == NULL ||
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    ggml_backend_buffer_t & stage = sched->input_stage[backend_id][c];
+    if (stage == NULL) {
+        // allocated once and never resized or freed while the scheduler lives
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+        stage = buft ? ggml_backend_buft_alloc_buffer(buft, stage_size) : NULL;
+        if (stage == NULL) {
+            GGML_LOG_WARN("%s: no pinned staging for %s, graph inputs stay synchronous\n", __func__, ggml_backend_name(backend));
+            sched->input_stage_failed[backend_id] = true;
+            return false;
+        }
+    }
+
+    const size_t nbytes = ggml_nbytes(input);
+    size_t &     off    = sched->input_stage_off[backend_id];
+    if (off + nbytes > ggml_backend_buffer_get_size(stage)) {
+        sched->n_input_sync++;
+        return false;
+    }
+
+    if (off == 0) {
+        // the copies from this region n_copies graphs ago are queued before the event of that graph
+        ggml_backend_event_synchronize(sched->events[backend_id][c]);
+    }
+
+    char * dst = (char *) ggml_backend_buffer_get_base(stage) + off;
+    memcpy(dst, input->data, nbytes);
+    // stream order puts the copy after the compute that last read input_cpy
+    ggml_backend_tensor_set_async(backend, input_cpy, dst, 0, nbytes);
+    off += GGML_PAD(nbytes, 256);
+
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, int turboprefill_stage) {
 
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // TurboPrefill replays saved ubatches through the same splits, keep its inputs synchronous
+    sched->input_async = turboprefill_stage == 0;
+    memset(sched->input_stage_off, 0, sizeof(sched->input_stage_off));
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1740,12 +1811,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (!ggml_backend_sched_copy_input_async(sched, split_backend_id, input, input_cpy)) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2437,6 +2510,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+            ggml_backend_buffer_free(sched->input_stage[b][c]);
         }
     }
     ggml_gallocr_free(sched->galloc);
