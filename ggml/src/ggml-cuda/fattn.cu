@@ -869,6 +869,7 @@ static bool ggml_cuda_flash_attn_ext_gather(ggml_backend_cuda_context & ctx, ggm
 static constexpr int FATTN_DEC_C     = 64;
 static constexpr int FATTN_DEC_MAX_C = 128; // chunks the combine kernel takes
 static constexpr int FATTN_DEC_MAX_Q = 16;  // query rows per launch (verify batches, decoding sequences)
+static constexpr int FATTN_DEC_PF_ROWS = 64; // prompt rows per launch on the sparse prompt path (bounds the partials)
 
 template <int D, int G>
 static __global__ void __launch_bounds__(256) fattn_dec_chunk(
@@ -1068,9 +1069,19 @@ static bool ggml_cuda_flash_attn_ext_decode(ggml_backend_cuda_context & ctx, ggm
     const int64_t D = K->ne[0];
     const int     G = K->ne[2] > 0 ? (int) (Q->ne[2] / K->ne[2]) : 0;
 
-    // up to FATTN_DEC_MAX_Q queries (speculative verify, several decoding sequences): each is a mask row
+    // up to FATTN_DEC_MAX_Q queries (speculative verify, several decoding sequences): each is a mask row.
+    // A prompt ubatch takes the same path once the context is several times the selection: every query
+    // row attends to its own n_kv_max keys, so the cost stays flat with depth, while the tile kernel runs
+    // over all n_kv keys with the top-k mask (QSA prefill at 32K: ~90 ms per layer per 1024 tokens).
+    // GGML_CUDA_NO_FA_SPARSE_PREFILL=1 disables it, GGML_CUDA_FA_SPARSE_PREFILL_MIN sets the n_kv/n_sel ratio (3).
+    static const bool pf_disabled = getenv("GGML_CUDA_NO_FA_SPARSE_PREFILL") != nullptr;
+    static const int  pf_min      = getenv("GGML_CUDA_FA_SPARSE_PREFILL_MIN") ? atoi(getenv("GGML_CUDA_FA_SPARSE_PREFILL_MIN")) : 3;
     const int n_q = (int) Q->ne[1];
-    if (n_q < 1 || n_q > FATTN_DEC_MAX_Q || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+    const bool prompt = n_q > FATTN_DEC_MAX_Q;
+    if (prompt && (pf_disabled || K->ne[1] < (int64_t) pf_min*GGML_PAD((int64_t) n_kv_max, FATTN_KQ_STRIDE))) {
+        return false;
+    }
+    if (n_q < 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
             mask->ne[1] < n_q || Q->nb[1] % 16 != 0 ||
             Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
@@ -1097,26 +1108,34 @@ static bool ggml_cuda_flash_attn_ext_decode(ggml_backend_cuda_context & ctx, ggm
     const int64_t mask_row = mask->nb[1]/sizeof(half);
     const int64_t q_row    = Q->nb[1]/sizeof(float);
 
-    const int n_cnt = (int) ((K->ne[1] + FATTN_GATHER_CHUNK - 1)/FATTN_GATHER_CHUNK);
-    ggml_cuda_pool_alloc<int32_t> idx(pool, sparse ? (size_t) n_q*(n_sel + n_cnt) : 1);
-    if (sparse) {
-        int32_t * counts = idx.get() + (size_t) n_q*n_sel;
-        fattn_gather_count<<<dim3(n_cnt, n_q, 1), 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, mask_row);
-        fattn_gather_compact<<<dim3(n_cnt, n_q, 1), 256, 0, stream>>>((const half *) mask->data, (int) K->ne[1], counts, idx.get(), (int) n_sel, mask_row);
-    }
+    // a prompt ubatch goes through in blocks of rows so the partial buffers stay small
+    const int n_rows = prompt ? FATTN_DEC_PF_ROWS : n_q;
 
-    ggml_cuda_pool_alloc<float>  part_o (pool, (size_t) n_q*n_ch*n_kvh*G*D);
-    ggml_cuda_pool_alloc<float2> part_ml(pool, (size_t) n_q*n_ch*n_kvh*G);
+    const int n_cnt = (int) ((K->ne[1] + FATTN_GATHER_CHUNK - 1)/FATTN_GATHER_CHUNK);
+    ggml_cuda_pool_alloc<int32_t> idx(pool, sparse ? (size_t) n_rows*(n_sel + n_cnt) : 1);
+
+    ggml_cuda_pool_alloc<float>  part_o (pool, (size_t) n_rows*n_ch*n_kvh*G*D);
+    ggml_cuda_pool_alloc<float2> part_ml(pool, (size_t) n_rows*n_ch*n_kvh*G);
 
     auto launch = [&](auto d_c, auto g_c) {
         constexpr int DT = decltype(d_c)::value;
         constexpr int GT = decltype(g_c)::value;
-        fattn_dec_chunk<DT, GT><<<dim3(n_ch, n_kvh, n_q), 256, 0, stream>>>(
-            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,
-            sparse ? idx.get() : nullptr, (int) n_keys, scale,
-            Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], part_o.get(), part_ml.get(),
-            q_row, mask_row, (int) n_sel);
-        fattn_dec_combine<DT><<<dim3(n_kvh*GT, n_q, 1), 256, 0, stream>>>(part_o.get(), part_ml.get(), (float *) dst->data, n_ch, GT);
+        for (int r0 = 0; r0 < n_q; r0 += n_rows) {
+            const int nr = std::min(n_rows, n_q - r0);
+            const half * mask_r = (const half *) mask->data + (int64_t) r0*mask_row;
+            if (sparse) {
+                int32_t * counts = idx.get() + (size_t) nr*n_sel;
+                fattn_gather_count<<<dim3(n_cnt, nr, 1), 256, 0, stream>>>(mask_r, (int) K->ne[1], counts, mask_row);
+                fattn_gather_compact<<<dim3(n_cnt, nr, 1), 256, 0, stream>>>(mask_r, (int) K->ne[1], counts, idx.get(), (int) n_sel, mask_row);
+            }
+            fattn_dec_chunk<DT, GT><<<dim3(n_ch, n_kvh, nr), 256, 0, stream>>>(
+                (const float *) Q->data + (int64_t) r0*q_row, (const char *) K->data, (const char *) V->data, mask_r,
+                sparse ? idx.get() : nullptr, (int) n_keys, scale,
+                Q->nb[2]/sizeof(float), K->nb[1], K->nb[2], V->nb[1], V->nb[2], part_o.get(), part_ml.get(),
+                q_row, mask_row, (int) n_sel);
+            fattn_dec_combine<DT><<<dim3(n_kvh*GT, nr, 1), 256, 0, stream>>>(part_o.get(), part_ml.get(),
+                (float *) dst->data + (int64_t) r0*n_kvh*GT*DT, n_ch, GT);
+        }
     };
     auto launch_g = [&](auto d_c) {
         switch (G) {
