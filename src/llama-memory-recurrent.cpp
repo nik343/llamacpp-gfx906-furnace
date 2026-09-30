@@ -1303,6 +1303,39 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+// The cells between n_seqs and n_rs belong to other sequences; their states are copied as well so that
+// pending moves and rollback restores land. When none is pending, every one of those copies moves a
+// state onto itself, and the copy (with its n_rs - n_seqs row temporary, which the worst-case reserve
+// does not size) is left out of the graph: a slot finishing among several decoding slots otherwise
+// made the scheduler reallocate. Side-effect free, unlike s_copy(). LLAMA_RS_COPY_ALL_EXTRA=1 keeps them.
+uint32_t llama_memory_recurrent_context::get_n_rs_extra(uint32_t n_seqs) const {
+    static const bool copy_all = getenv("LLAMA_RS_COPY_ALL_EXTRA") != nullptr;
+
+    const uint32_t n_rs = get_n_rs();
+    if (n_rs <= n_seqs) {
+        return 0;
+    }
+    if (is_full || copy_all) {
+        return n_rs - n_seqs;
+    }
+
+    for (uint32_t i = n_seqs; i < n_rs; ++i) {
+        const uint32_t cell_idx = i + mem->head;
+        const auto &   cell     = mem->cells[cell_idx];
+        if (cell.src0 != (int32_t) cell_idx) {
+            return n_rs - n_seqs;
+        }
+        if (mem->n_rs_seq > 0 && !cell.seq_id.empty()) {
+            const llama_seq_id seq = *cell.seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
+                return n_rs - n_seqs;
+            }
+        }
+    }
+
+    return 0;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;

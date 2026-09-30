@@ -177,6 +177,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // state rows the graph copies for cells in the range that the ubatch does not own
+    uint32_t get_n_rs_extra(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 
