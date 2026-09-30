@@ -1568,6 +1568,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // async graph-input copies let the devices of a layer split overlap consecutive ubatches of a prompt;
+    // single-token and verify steps run the devices one after another anyway and decode measured slower
+    // with them (tg64 49 -> 42 t/s, with high variance), so those keep the synchronous copies
+    ggml_backend_sched_set_input_async(sched.get(), ubatch.n_tokens >= 64);
+
     const int64_t t_gc0 = ggml_time_us();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (decode_time_log()) {

@@ -888,6 +888,7 @@ struct ggml_backend_sched {
     size_t  input_stage_off[GGML_SCHED_MAX_BACKENDS];
     bool    input_stage_failed[GGML_SCHED_MAX_BACKENDS];
     bool    input_async;     // async input copies allowed for the current compute
+    bool    input_async_req; // requested by the user, ggml_backend_sched_set_input_async()
     int64_t n_input_sync;    // graph inputs that still took the synchronous path
 };
 
@@ -1771,7 +1772,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     // TurboPrefill replays saved ubatches through the same splits, keep its inputs synchronous
-    sched->input_async = turboprefill_stage == 0;
+    sched->input_async = turboprefill_stage == 0 && sched->input_async_req;
     memset(sched->input_stage_off, 0, sizeof(sched->input_stage_off));
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2679,6 +2680,11 @@ int ggml_backend_sched_get_next_copy(ggml_backend_sched_t sched) {
 int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_realloc;
+}
+
+void ggml_backend_sched_set_input_async(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->input_async_req = enable;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
