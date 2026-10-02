@@ -25,6 +25,7 @@ struct server_context_meta {
     bool has_inp_video;
     json json_ui_settings;
     int slot_n_ctx;
+    int n_ctx_pool; // total KV context shared by all slots
     enum llama_pooling_type pooling_type;
 
     // chat params
