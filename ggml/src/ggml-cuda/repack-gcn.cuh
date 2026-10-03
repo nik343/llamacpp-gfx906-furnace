@@ -56,7 +56,10 @@ void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const gg
 
 // drop cached q8_1 activations whose source range node writes
 // (force: also entries this node produced itself)
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false);
+// keep: also spare entries produced by this node (the last node of a fused group, whose q8_1 copy the
+// fused kernel wrote from final values; the group's elided intermediates may share its memory)
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false,
+        const ggml_tensor * keep = nullptr);
 
 bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
     const ggml_tensor * glu);

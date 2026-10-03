@@ -22,3 +22,7 @@ void ggml_cuda_op_rms_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 // RMS_NORM -> MUL that also writes q8_1 blocks of the result into yq; false: not applicable, nothing launched
 bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * yq);
+
+// residual ADD -> RMS_NORM -> MUL (yq: optional q8_1 copy of the MUL output); false = not applicable
+bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm,
+        ggml_tensor * mul_tensor, void * yq);

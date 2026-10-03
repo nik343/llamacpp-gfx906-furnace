@@ -5232,6 +5232,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // residual ADD -> RMS_NORM -> MUL: the sum stays live (next residual add reads it), so the generic
+    // single-use check cannot cover the ADD; the norm/mul pair still goes through it
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[i + 1]->src[0] == node && ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        static const bool no_add_norm = getenv("GGML_CUDA_NO_ADD_NORM_FUSION") != nullptr;
+        if (!no_add_norm) {
+            ggml_tensor * mul_node = cgraph->nodes[i + 2];
+            void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, mul_node);
+            if (ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], mul_node, yq)) {
+                return 2;
+            }
+            if (yq != nullptr) {
+                ggml_cuda_repack_xq_invalidate(*cuda_ctx, mul_node, true);
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5596,7 +5613,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (nodes_to_skip != 0) {
                     for (int j = 1; j <= nodes_to_skip; ++j) {
-                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j]);
+                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j], false, cgraph->nodes[i + nodes_to_skip]);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;

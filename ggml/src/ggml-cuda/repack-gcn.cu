@@ -3735,14 +3735,16 @@ static bool repack_rc_reserve(ggml_cuda_repack_route_cache & rc, void ** buf, si
     return true;
 }
 
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force) {
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force,
+        const ggml_tensor * keep) {
     if (node->data == nullptr) {
         return;
     }
     const char * lo = (const char *) node->data;
     const char * hi = lo + ggml_nbytes(node);
     for (auto & e : ctx.repack_rc.xqc) {
-        if (e.gen == ctx.graph_gen && (force || e.producer != node) && lo < e.hi && e.lo < hi) {
+        if (e.gen == ctx.graph_gen && (force || (e.producer != node && (keep == nullptr || e.producer != keep))) &&
+                lo < e.hi && e.lo < hi) {
             e.gen = 0;
         }
     }
