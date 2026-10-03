@@ -5,6 +5,10 @@
 #include "ggml-backend-impl.h"
 #include "mmid.cuh"
 #include "unary.cuh"
+#include "vecdotq.cuh"
+#include "ggml-quants.h"
+#include <vector>
+#include <cmath>
 
 #include <cstdlib>
 #include <cstring>
@@ -32,7 +36,20 @@ static __host__ __device__ inline int64_t repack_q4k_nsp(const int64_t ne0) {
 //   Q6_K: 16 nib + 8 h2 + 2 signed-scale-pair per sub-block, 2 (d) per superblock
 //   Q8_0: 32 qs + 2 (d fp16) per sub-block
 //   Q5_1: 16 nib + 4 qh + 4 (d, m fp16) per sub-block
-static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, const int64_t ne1) {
+//   Q4_0: 16 nib + 2 (d fp16) per sub-block (crossport R11; the IQ4 family shares this layout)
+// Q3_K is stored and computed as Q6_K planes (crossport R12, exact: q6 = q3 + 28 with the same
+// signed per-16 scales), so it runs the Q6_K kernels; its own 3-bit kernels stay behind
+// GGML_CUDA_Q3K_RELABEL=0. Every dispatch switch and the size table go through this.
+static inline ggml_type repack_eff_type(const ggml_type type) {
+    static const bool relabel = [] {
+        const char * e = getenv("GGML_CUDA_Q3K_RELABEL");
+        return e == nullptr || e[0] != '0';
+    }();
+    return (type == GGML_TYPE_Q3_K && relabel) ? GGML_TYPE_Q6_K : type;
+}
+
+static inline size_t repack_gcn_nbytes(const ggml_type type_in, const int64_t ne0, const int64_t ne1) {
+    const ggml_type type    = repack_eff_type(type_in);
     const int64_t nsp      = repack_q4k_nsp(ne0);
     const int64_t n_blocks = ne0 / 256;
     switch (type) {
@@ -42,6 +59,10 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         case GGML_TYPE_Q6_K: return (size_t) ne1 * (nsp * 26 + n_blocks * 2);
         case GGML_TYPE_Q8_0: return (size_t) ne1 * nsp * 34;
         case GGML_TYPE_Q5_1: return (size_t) ne1 * nsp * 24;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:  return (size_t) ne1 * nsp * 18;
         default:             GGML_ABORT("unsupported repack type");
     }
 }
@@ -76,6 +97,26 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
                 return e != nullptr && e[0] != '0';
             }();
             return q51 && t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_Q4_0: {
+            // 2D weights only (no expert kernels yet); GGML_CUDA_REPACK_Q4_0=0 opts out
+            static const bool q40 = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+                return e == nullptr || e[0] != '0';
+            }();
+            return q40 && ggml_n_dims(t) == 2 && t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S: {
+            // the IQ family relabels onto the Q4_0 planes (IQ4_NL exactly; IQ4_XS / IQ3_S with the
+            // sub-block scale folded to fp16, and IQ3_S at 4.5 instead of 3.44 bpw on device);
+            // 2D weights only. GGML_CUDA_REPACK_IQ=0 opts out.
+            static const bool iq = [] {
+                const char * e = getenv("GGML_CUDA_REPACK_IQ");
+                return e == nullptr || e[0] != '0';
+            }();
+            return iq && ggml_n_dims(t) == 2 && t->ne[0] % (t->type == GGML_TYPE_IQ4_NL ? 32 : 256) == 0;
         }
         default:             return false;
     }
@@ -324,6 +365,133 @@ static void repack_q3k_host(const block_q3_K * blocks, uint8_t * dst, const int6
     }
 }
 
+// Q3_K relabelled to Q6_K planes (exact): w = d*(sc-32)*(q3-4) = d*(sc-32)*((q3+28)-32), so q6 = q3+28
+// and the signed per-16-weight scales carry over unchanged. Same plane layout as repack_q6k_host.
+static void repack_q3k_as_q6k_host(const block_q3_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 256;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  nib_len  = (size_t) ne1 * nsp * 16;
+    const size_t  h2_len   = (size_t) ne1 * nsp * 8;
+    const size_t  sm_len   = (size_t) ne1 * nsp * 2;
+    memset(dst, 0, nib_len + h2_len + sm_len + (size_t) ne1 * n_blocks * 2);
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_q3_K * b = &blocks[row * n_blocks + blk];
+            memcpy(dst + nib_len + h2_len + sm_len + (size_t)(row * n_blocks + blk) * 2, &b->d, 2);
+            uint32_t aux[4];
+            memcpy(aux, b->scales, 12);
+            const uint32_t tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = ( aux[0]       & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = ( aux[1]       & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            const uint8_t * sc6 = (const uint8_t *) aux;
+            for (int s = 0; s < 8; s++) {
+                const int64_t gsb   = blk * 8 + s;
+                const int     n     = s >> 2;
+                const int     shift = 2 * (s & 3);
+                const uint8_t * qs  = b->qs + n * 32;
+                uint8_t lo[32], hi[32];
+                for (int k = 0; k < 32; k++) {
+                    const int q6 = (((qs[k] >> shift) & 3) | (((b->hmask[k] >> s) & 1) << 2)) + 28;
+                    lo[k] = (uint8_t) (q6 & 0x0F);
+                    hi[k] = (uint8_t) (q6 >> 4);
+                }
+                uint8_t * nib = dst + (size_t)(row * nsp + gsb) * 16;
+                uint8_t h2p[8] = {};
+                for (int j = 0; j < 4; j++) {
+                    for (int bb = 0; bb < 4; bb++) {
+                        nib[j * 4 + bb] = lo[4 * j + bb] | (lo[16 + 4 * j + bb] << 4);
+                        h2p[2 * j]     |= hi[4 * j + bb]      << (2 * bb);
+                        h2p[2 * j + 1] |= hi[16 + 4 * j + bb] << (2 * bb);
+                    }
+                }
+                memcpy(dst + nib_len + (size_t)(row * nsp + gsb) * 8, h2p, 8);
+                uint8_t * sm = dst + nib_len + h2_len + (size_t)(row * nsp + gsb) * 2;
+                sm[0] = (uint8_t) (int8_t) ((int) sc6[2 * s]     - 32);
+                sm[1] = (uint8_t) (int8_t) ((int) sc6[2 * s + 1] - 32);
+            }
+        }
+    }
+}
+
+// ggml_half is a device half type in this TU: read the superblock scale by its bits
+static inline float repack_half_bits_to_f32(const void * p) {
+    uint16_t b;
+    memcpy(&b, p, 2);
+    return ggml_fp16_to_fp32(b);
+}
+
+// IQ4_NL onto the Q4_0 planes: same 32-weight blocks (fp16 d, 16 nibble bytes), exact.
+static void repack_iq4_nl_host(const block_iq4_nl * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 32;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  nib_len  = (size_t) ne1 * nsp * 16;
+    memset(dst, 0, nib_len + (size_t) ne1 * nsp * 2);
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_iq4_nl * b = &blocks[row * n_blocks + blk];
+            const size_t idx = (size_t)(row * nsp + blk);
+            memcpy(dst + idx * 16, b->qs, 16);
+            memcpy(dst + nib_len + idx * 2, &b->d, 2);
+        }
+    }
+}
+
+// IQ4_XS onto the Q4_0 planes: the 8 sub-blocks' nibbles copied, d*(ls-32) folded to one fp16 per
+// sub-block (<= 2^-11 relative rounding; not bit-exact against ggml's dequant).
+static void repack_iq4_xs_host(const block_iq4_xs * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 256;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  nib_len  = (size_t) ne1 * nsp * 16;
+    memset(dst, 0, nib_len + (size_t) ne1 * nsp * 2);
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_iq4_xs * b = &blocks[row * n_blocks + blk];
+            const float d = repack_half_bits_to_f32(&b->d);
+            for (int ib = 0; ib < 8; ib++) {
+                const size_t idx = (size_t)(row * nsp + blk * 8 + ib);
+                memcpy(dst + idx * 16, b->qs + 16 * ib, 16);
+                const int ls = ((b->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((b->scales_h >> 2 * ib) & 3) << 4);
+                const ggml_fp16_t dl = ggml_fp32_to_fp16(d * (float) (ls - 32));
+                memcpy(dst + nib_len + idx * 2, &dl, 2);
+            }
+        }
+    }
+}
+
+// IQ3_S onto the nibble planes: ggml's own dequantizer recovers each weight as db * v with v an odd
+// integer in -15..15, stored as the nibble (v + 15) / 2 (the device codebook is 2n - 15), and
+// db = d * (1 + 2*s) folded to fp16 per sub-block. 4.5 bpw on device for 3.44 on disk.
+static void repack_iq3_s_host(const block_iq3_s * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 256;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  nib_len  = (size_t) ne1 * nsp * 16;
+    memset(dst, 0, nib_len + (size_t) ne1 * nsp * 2);
+    std::vector<float> yf(256);
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_iq3_s * b = &blocks[row * n_blocks + blk];
+            dequantize_row_iq3_s(b, yf.data(), 256);
+            const float d = repack_half_bits_to_f32(&b->d);
+            for (int ib = 0; ib < 8; ib++) {
+                const size_t idx = (size_t)(row * nsp + blk * 8 + ib);
+                const float db = d * (float) (1 + 2 * ((b->scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+                uint8_t * nib = dst + idx * 16;
+                for (int k = 0; k < 16; k++) {
+                    const int v0 = (int) lroundf(yf[32 * ib + k]      / db); // odd, -15..15
+                    const int v1 = (int) lroundf(yf[32 * ib + k + 16] / db);
+                    nib[k] = (uint8_t) (((v0 + 15) >> 1) | (((v1 + 15) >> 1) << 4));
+                }
+                const ggml_fp16_t dl = ggml_fp32_to_fp16(db);
+                memcpy(dst + nib_len + idx * 2, &dl, 2);
+            }
+        }
+    }
+}
+
 // Q8_0: two planes — 32 aligned qs bytes per sub-block, then the fp16
 // d-scales as their own stream. Same bytes as on-disk modulo padding;
 // the win is alignment (one i32 load per sdot4 instead of two
@@ -372,6 +540,23 @@ static void repack_q5_1_host(const block_q5_1 * blocks, uint8_t * dst, const int
             }
             memcpy(dst + nib_len + idx * 4, &qh_packed, 4);
             memcpy(dst + nib_len + qh_len + idx * 4, &b->dm, 4);
+        }
+    }
+}
+
+// Q4_0: nibble plane (qs as-is: byte k = weight k low / k+16 high, the dp4a group order) and an
+// fp16 d plane. The pad sub-block reads as zero weights with a zero scale.
+static void repack_q4_0_host(const block_q4_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    const int64_t n_blocks = ne0 / 32;
+    const int64_t nsp      = repack_q4k_nsp(ne0);
+    const size_t  nib_len  = (size_t) ne1 * nsp * 16;
+    memset(dst, 0, nib_len + (size_t) ne1 * nsp * 2);
+    for (int64_t row = 0; row < ne1; row++) {
+        for (int64_t blk = 0; blk < n_blocks; blk++) {
+            const block_q4_0 * b = &blocks[row * n_blocks + blk];
+            const size_t idx = (size_t)(row * nsp + blk);
+            memcpy(dst + idx * 16, b->qs, 16);
+            memcpy(dst + nib_len + idx * 2, &b->d, 2);
         }
     }
 }
@@ -653,6 +838,176 @@ static __global__ void mul_mat_vec_q5k_repacked(
     }
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds, n_expert, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// --- nibble + fp16 scale plane formats (Q4_0 now; IQ4_NL / IQ4_XS / IQ3_S relabel onto the same
+// planes with a 16-entry codebook instead of q - 8, crossport R11/R12) ------------------------------
+enum { REPACK_NIB_Q4_0 = 0, REPACK_NIB_IQ4NL = 1, REPACK_NIB_IQ3S = 2 };
+
+// bytewise v - 8 on four nibbles without inter-byte borrow: the signed int8 Q4_0 weight dp4a wants
+static __device__ __forceinline__ uint32_t repack_sub8(const uint32_t v) {
+    return ((v | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+}
+
+// IQ3_S values are the odd numbers -15..15: nibble n <-> 2n - 15
+static const __device__ int8_t repack_kvalues_iq3s[16] = { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 };
+
+// one nibble word (weights 4j..4j+3 low, 16+4j..16+4j+3 high) to two signed int8 dp4a words
+template <int MODE>
+static __device__ __forceinline__ void repack_nib_decode(const uint32_t q, int & lo, int & hi) {
+    if constexpr (MODE == REPACK_NIB_Q4_0) {
+        lo = (int) repack_sub8( q       & 0x0F0F0F0Fu);
+        hi = (int) repack_sub8((q >> 4) & 0x0F0F0F0Fu);
+    } else {
+        const int2 v = get_int_from_table_16((int) q, MODE == REPACK_NIB_IQ4NL ? kvalues_iq4nl : repack_kvalues_iq3s);
+        lo = v.x;
+        hi = v.y;
+    }
+}
+
+// Decode matvec on the nibble + scale planes, ROWS=2 per wave (reinstinct's matvec_q4_0_repacked).
+// Q4_0 folds the constant -8 into the integer domain against the quantized activation sum
+// (xqsum = sum dp4a(1, xq)), one hoisted per sub-block; dw*dx*(idot - 8*xqsum) is then the exact
+// integer dot the sub8 form computes, so this, the nc kernel and the MMQ tile agree exactly. The
+// codebook modes decode the nibbles (two perm lookups per word) and dot directly.
+template <int MODE>
+static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    constexpr int ROWS = 2;
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 16);
+
+    float acc[ROWS] = {0.0f, 0.0f};
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+        int xqsum = 0;
+        if constexpr (MODE == REPACK_NIB_Q4_0) {
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                xqsum = ggml_cuda_dp4a(0x01010101, xq32[g], xqsum);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const size_t   idx = (size_t) row * nsp + sb;
+            const uint4    q   = nib[idx];
+            const uint16_t db  = dp[idx];
+            const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            int idot = 0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                if constexpr (MODE == REPACK_NIB_Q4_0) {
+                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                } else {
+                    int lo, hi;
+                    repack_nib_decode<MODE>(qa[j], lo, hi);
+                    idot = ggml_cuda_dp4a(lo, xq32[j],     idot);
+                    idot = ggml_cuda_dp4a(hi, xq32[j + 4], idot);
+                }
+            }
+            acc[r] += dw * dx * (float) (idot - 8 * xqsum);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float a = warp_reduce_sum<64>(acc[r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            y[row0 + r] = a;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Dense gate+up GLU on the nibble planes (both slabs per sub-block, one xqsum), ROWS=2 per wave.
+template <int MODE>
+static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    constexpr int ROWS = 2;
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint8_t * wb[2] = { wup, wgate };
+
+    float acc[2][ROWS] = {};
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+        int xqsum = 0;
+        if constexpr (MODE == REPACK_NIB_Q4_0) {
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                xqsum = ggml_cuda_dp4a(0x01010101, xq32[g], xqsum);
+            }
+        }
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
+            const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int row = row0 + r;
+                if (row >= (int) ne1) {
+                    continue;
+                }
+                const size_t   idx = (size_t) row * nsp + sb;
+                const uint4    q   = nib[idx];
+                const uint16_t db  = dp[idx];
+                const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
+                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                int idot = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    if constexpr (MODE == REPACK_NIB_Q4_0) {
+                        idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                        idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                    } else {
+                        int lo, hi;
+                        repack_nib_decode<MODE>(qa[j], lo, hi);
+                        idot = ggml_cuda_dp4a(lo, xq32[j],     idot);
+                        idot = ggml_cuda_dp4a(hi, xq32[j + 4], idot);
+                    }
+                }
+                acc[w2][r] += dw * dx * (float) (idot - 8 * xqsum);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_v   = warp_reduce_sum<64>(acc[0][r]);
+        const float gate_v = warp_reduce_sum<64>(acc[1][r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU ? ggml_cuda_op_silu_single(gate_v) : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
     NO_DEVICE_CODE;
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
@@ -2811,6 +3166,106 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// MMQ on the nibble + fp16 scale planes (Q4_0 and the IQ4 family): the Q5_1 tile with the weights
+// decoded to signed int8 once at LDS staging (sub8 or the codebook) and one float scale per
+// (row, sub-block). Dense only.
+template <int MODE, int TN_>
+static __global__ void __launch_bounds__(256, 2) mmq_gemm_nib_repacked(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t n_tok, const uint32_t x_stride, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+    const uint32_t row0 = blockIdx.x * MMQ_RP_BM;
+    const uint32_t tok0 = blockIdx.y * (16 * TN_);
+
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
+    const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 16);
+
+    __shared__ int        sW8[MMQ_RP_BM][MMQ_RP_BK][8];
+    __shared__ float      sWs[MMQ_RP_BM][MMQ_RP_BK];
+    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1];
+
+    float acc[MMQ_RP_TM][TN_] = {};
+    const int lr = t >> 2;
+    const int lk = t & 3;
+    const bool xstage = lr < (16 * TN_);
+
+    for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_BK) {
+        const uint32_t sb   = sb0 + lk;
+        const uint32_t wrow = row0 + lr;
+        if (wrow < ne1 && sb < n_sub) {
+            const size_t   idx = (size_t) wrow * nsp + sb;
+            const uint4    q   = nib[idx];
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                repack_nib_decode<MODE>(qa[j], sW8[lr][lk][j], sW8[lr][lk][4 + j]);
+            }
+            const uint16_t db = dp[idx];
+            sWs[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&db));
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                sW8[lr][lk][j] = 0;
+            }
+            sWs[lr][lk] = 0.0f;
+        }
+        if (xstage) {
+            if (tok0 + lr < n_tok && sb < n_sub) {
+                sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+            } else {
+                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < MMQ_RP_BK; kk++) {
+#pragma unroll
+            for (int n = 0; n < TN_; n++) {
+                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+                const float dx = __low2float(xb->ds);
+#pragma unroll
+                for (int r = 0; r < MMQ_RP_TM; r++) {
+                    const int * w8 = sW8[ty + r * 16][kk];
+                    int idot = 0;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        idot = ggml_cuda_dp4a(w8[j], xq32[j], idot);
+                    }
+                    acc[r][n] += sWs[ty + r * 16][kk] * dx * (float) idot;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < MMQ_RP_TM; r++) {
+        const uint32_t row = row0 + ty + r * 16;
+        if (row >= ne1) {
+            continue;
+        }
+#pragma unroll
+        for (int n = 0; n < TN_; n++) {
+            const uint32_t tok = tok0 + tx + n * 16;
+            if (tok < n_tok) {
+                y[(size_t) tok * dst_s1 + row] = acc[r][n];
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, x_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // Q6_K MMQ — weights expanded to int8 (q6 - 32) at LDS staging (two uint4 per
 // sub-block, in the activation's dp4a group order), so the inner loop is a plain
 // int8 dot like Q8_0's. Unpacking the 6-bit planes there instead cost
@@ -3835,7 +4290,11 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_kq_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
 #if defined(GGML_USE_HIP) && defined(GCN)
-    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K, "unsupported type");
+    static_assert(type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+                  type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S,
+                  "unsupported type");
+    constexpr bool NIB  = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S;
+    constexpr int  MODE = type == GGML_TYPE_Q4_0 ? REPACK_NIB_Q4_0 : type == GGML_TYPE_IQ3_S ? REPACK_NIB_IQ3S : REPACK_NIB_IQ4NL;
     constexpr int ROWS = 2;
     const int wave = threadIdx.x >> 6;
     const int lane = threadIdx.x & 63;
@@ -3872,7 +4331,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_kq_repacked_nc(
             const size_t   idx = (size_t) row * nsp + sb;
             const uint4    q   = nib[idx];
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-            const uint16_t sm  = smp[idx];
+            if constexpr (NIB) {
+                // nibble + fp16 scale planes: decode to signed int8 once per row, no min term
+                const uint16_t db = reinterpret_cast<const uint16_t *>(p1)[idx];
+                s0[r] = __half2float(*reinterpret_cast<const __half *>(&db));
+                s1[r] = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    repack_nib_decode<MODE>(qa[j], wl[r][j], wh[r][j]);
+                }
+                continue;
+            }
+            const uint16_t sm  = NIB ? 0 : smp[idx];
             if constexpr (type == GGML_TYPE_Q6_K) {
                 const uint32_t * h2p = reinterpret_cast<const uint32_t *>(p1);
                 const uint32_t h2lo = h2p[idx * 2];
@@ -4129,18 +4599,24 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     }
     // dense K-quants, 2..16 columns: weight-once matvec instead of the 64-wide MMQ tile
     static const bool no_kq_nc = getenv("GGML_CUDA_NO_KQ_NC") != nullptr;
+    const ggml_type eff = repack_eff_type(src0->type);
     if (!no_kq_nc && ne11 >= 2 && ne11 <= 16 &&
-        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K)) {
-        switch (src0->type) {
-            case GGML_TYPE_Q4_K: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q4_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
-            case GGML_TYPE_Q5_K: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q5_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
-            default:             launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q6_K>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+        (eff == GGML_TYPE_Q4_K || eff == GGML_TYPE_Q5_K || eff == GGML_TYPE_Q6_K || eff == GGML_TYPE_Q4_0 ||
+         eff == GGML_TYPE_IQ4_NL || eff == GGML_TYPE_IQ4_XS || eff == GGML_TYPE_IQ3_S)) {
+        switch (eff) {
+            case GGML_TYPE_Q4_K:   launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q4_K>  (w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            case GGML_TYPE_Q5_K:   launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q5_K>  (w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            case GGML_TYPE_Q4_0:   launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q4_0>  (w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            case GGML_TYPE_IQ4_NL: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_IQ4_NL>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            case GGML_TYPE_IQ4_XS: launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_IQ4_XS>(w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            case GGML_TYPE_IQ3_S:  launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_IQ3_S> (w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
+            default:               launch_mul_mat_vec_kq_repacked_nc<GGML_TYPE_Q6_K>  (w, xq, dst_d, ne00, ne01, ne11, x_stride, stream); break;
         }
         return;
     }
     if (ne11 == 1) {
         // decode: dp4a matvec straight from the planes
-        switch (src0->type) {
+        switch (repack_eff_type(src0->type)) {
             case GGML_TYPE_Q3_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
                 mul_mat_vec_q3k_repacked<false><<<grid, 256, 0, stream>>>(
@@ -4174,6 +4650,19 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 mul_mat_vec_q5_1_repacked<false><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, nullptr, nullptr, 0, 0, 0, 0);
+            } break;
+            case GGML_TYPE_Q4_0: {
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_nib_repacked<REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
+            } break;
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS: {
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_nib_repacked<REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
+            } break;
+            case GGML_TYPE_IQ3_S: {
+                const dim3 grid((ne01 + 7) / 8, 1, 1);
+                mul_mat_vec_nib_repacked<REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01);
             } break;
             case GGML_TYPE_Q8_0: {
                 // short rows: several rows per wave (see mul_mat_vec_q8_0_repacked_seg)
@@ -4223,41 +4712,68 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         return;
     }
 
-    // prefill: int8 MMQ tile GEMM straight from the repacked planes
-    const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM,
-                    (ne11 + MMQ_RP_BN - 1) / MMQ_RP_BN, 1);
-    switch (src0->type) {
-        case GGML_TYPE_Q3_K:
-            mmq_gemm_q3k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        case GGML_TYPE_Q4_K:
-            mmq_gemm_q4k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        case GGML_TYPE_Q5_K:
-            mmq_gemm_q5k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        case GGML_TYPE_Q6_K:
-            mmq_gemm_q6k_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        case GGML_TYPE_Q5_1:
-            mmq_gemm_q5_1_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        case GGML_TYPE_Q8_0:
-            mmq_gemm_q8_0_repacked<false, MMQ_RP_TN><<<grid, 256, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
-                nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
-            break;
-        default: GGML_ABORT("unsupported repack type");
+    // prefill: int8 MMQ tile GEMM straight from the repacked planes. The token tile is 16*TN wide;
+    // 17..48 columns (short prompts, MTP eh_proj) take the 32/48-wide instantiations instead of
+    // paying for a 64-wide tile (Q4_0 5120x17408 at 24 columns: 786 -> ~400 us).
+    auto launch_tn = [&](auto tn_c) {
+        constexpr int TN = decltype(tn_c)::value;
+        const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM, (ne11 + 16 * TN - 1) / (16 * TN), 1);
+        switch (repack_eff_type(src0->type)) {
+            case GGML_TYPE_Q3_K:
+                mmq_gemm_q3k_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_K:
+                mmq_gemm_q4k_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q5_K:
+                mmq_gemm_q5k_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q6_K:
+                mmq_gemm_q6k_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q5_1:
+                mmq_gemm_q5_1_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q8_0:
+                mmq_gemm_q8_0_repacked<false, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_Q4_0:
+                mmq_gemm_nib_repacked<REPACK_NIB_Q4_0, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                mmq_gemm_nib_repacked<REPACK_NIB_IQ4NL, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride, (uint32_t) ne01);
+                break;
+            case GGML_TYPE_IQ3_S:
+                mmq_gemm_nib_repacked<REPACK_NIB_IQ3S, TN><<<grid, 256, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, (uint32_t) x_stride, (uint32_t) ne01);
+                break;
+            default: GGML_ABORT("unsupported repack type");
+        }
+    };
+    static const bool no_narrow = getenv("GGML_CUDA_NO_MMQ_NARROW") != nullptr;
+    if (no_narrow || ne11 > 48) {
+        launch_tn(std::integral_constant<int, MMQ_RP_TN>{});
+    } else if (ne11 <= 16) {
+        launch_tn(std::integral_constant<int, 1>{});
+    } else if (ne11 <= 32) {
+        launch_tn(std::integral_constant<int, 2>{});
+    } else {
+        launch_tn(std::integral_constant<int, 3>{});
     }
     GGML_UNUSED(ctx);
 }
@@ -4640,7 +5156,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         // shared activation column for all slots) uses x-stride 0; a few
         // tokens have one expanded column per slot.
         const uint32_t xs_eff = src1->ne[1] == 1 && !small ? 0u : (uint32_t) x_stride;
-        switch (src0->type) {
+        switch (repack_eff_type(src0->type)) {
             case GGML_TYPE_Q3_K: {
                 const dim3 grid((ne01 + 7) / 8, n_assign, 1);
                 mul_mat_vec_q3k_repacked<true><<<grid, 256, 0, stream>>>(
@@ -4708,7 +5224,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
 
     const dim3 grid((ne01 + MMQ_RP_BM - 1) / MMQ_RP_BM, max_tiles, 1);
 
-    switch (src0->type) {
+    switch (repack_eff_type(src0->type)) {
         case GGML_TYPE_Q3_K:
             mmq_gemm_q3k_repacked<true, TN_ID><<<grid, 256, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, 0, (uint32_t) x_stride,
@@ -4765,8 +5281,10 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
     if (wu->type != wg->type || !ggml_are_same_shape(wu, wg)) {
         return false;
     }
-    // Q8_0: dense decode only (shared expert)
-    if (wu->type != GGML_TYPE_Q4_K && !(wu->type == GGML_TYPE_Q8_0 && up->src[2] == nullptr)) {
+    // Q8_0 / Q4_0 / IQ family: dense decode only
+    const bool dense_only = wu->type == GGML_TYPE_Q8_0 || wu->type == GGML_TYPE_Q4_0 || wu->type == GGML_TYPE_IQ4_NL ||
+                            wu->type == GGML_TYPE_IQ4_XS || wu->type == GGML_TYPE_IQ3_S;
+    if (wu->type != GGML_TYPE_Q4_K && !(dense_only && up->src[2] == nullptr)) {
         return false;
     }
     const ggml_glu_op op = ggml_get_glu_op(glu);
@@ -4852,6 +5370,16 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
         // dense decode column
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
+        if (up_w->type == GGML_TYPE_Q4_0 || up_w->type == GGML_TYPE_IQ4_NL || up_w->type == GGML_TYPE_IQ4_XS ||
+                up_w->type == GGML_TYPE_IQ3_S) {
+            const dim3 grid((ne01 + 7) / 8, 1, 1);
+            switch (up_w->type) {
+                case GGML_TYPE_Q4_0:  mul_mat_vec_nib_repacked_glu<REPACK_NIB_Q4_0> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
+                case GGML_TYPE_IQ3_S: mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ3S> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
+                default:              mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
+            }
+            return;
+        }
         if (up_w->type == GGML_TYPE_Q8_0) {
             const dim3 grid((ne01 + 3) / 4, 1, 1);
             static const bool no_glu_unroll = getenv("GGML_CUDA_NO_Q8_GLU_UNROLL") != nullptr;
@@ -4991,12 +5519,22 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
         const uint8_t * src_e = (const uint8_t *) data + e * src_stride;
         uint8_t       * dst_e = staged.data() + e * dst_stride;
         switch (tensor->type) {
-            case GGML_TYPE_Q3_K: repack_q3k_host ((const block_q3_K *) src_e, dst_e, ne0, ne1); break;
+            case GGML_TYPE_Q3_K:
+                if (repack_eff_type(GGML_TYPE_Q3_K) == GGML_TYPE_Q6_K) {
+                    repack_q3k_as_q6k_host((const block_q3_K *) src_e, dst_e, ne0, ne1);
+                } else {
+                    repack_q3k_host((const block_q3_K *) src_e, dst_e, ne0, ne1);
+                }
+                break;
+            case GGML_TYPE_IQ4_NL: repack_iq4_nl_host((const block_iq4_nl *) src_e, dst_e, ne0, ne1); break;
+            case GGML_TYPE_IQ4_XS: repack_iq4_xs_host((const block_iq4_xs *) src_e, dst_e, ne0, ne1); break;
+            case GGML_TYPE_IQ3_S:  repack_iq3_s_host ((const block_iq3_s  *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q4_K: repack_q4k_host ((const block_q4_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q5_K: repack_q5k_host ((const block_q5_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q6_K: repack_q6k_host ((const block_q6_K *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q8_0: repack_q8_0_host((const block_q8_0 *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q5_1: repack_q5_1_host((const block_q5_1 *) src_e, dst_e, ne0, ne1); break;
+            case GGML_TYPE_Q4_0: repack_q4_0_host((const block_q4_0 *) src_e, dst_e, ne0, ne1); break;
             default:             GGML_ABORT("unsupported repack type");
         }
     }
@@ -5007,6 +5545,36 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
     CUDA_CHECK(cudaMemcpyAsync(tensor->data, staged.data(), staged.size(),
         cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+// host-side entry points for tests/test-repack-host.cpp (layout checks without a device)
+size_t ggml_cuda_repack_nbytes_for_test(ggml_type type, int64_t ne0, int64_t ne1) {
+    return repack_gcn_nbytes(type, ne0, ne1);
+}
+int ggml_cuda_repack_eff_type_for_test(ggml_type type) {
+    return (int) repack_eff_type(type);
+}
+void ggml_cuda_repack_host_for_test(ggml_type type, const void * src, void * dst, int64_t ne0, int64_t ne1) {
+    uint8_t * d = (uint8_t *) dst;
+    switch (type) {
+        case GGML_TYPE_Q3_K:
+            if (repack_eff_type(GGML_TYPE_Q3_K) == GGML_TYPE_Q6_K) {
+                repack_q3k_as_q6k_host((const block_q3_K *) src, d, ne0, ne1);
+            } else {
+                repack_q3k_host((const block_q3_K *) src, d, ne0, ne1);
+            }
+            break;
+        case GGML_TYPE_Q4_K:   repack_q4k_host   ((const block_q4_K   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_Q5_K:   repack_q5k_host   ((const block_q5_K   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_Q6_K:   repack_q6k_host   ((const block_q6_K   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_Q8_0:   repack_q8_0_host  ((const block_q8_0   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_Q5_1:   repack_q5_1_host  ((const block_q5_1   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_Q4_0:   repack_q4_0_host  ((const block_q4_0   *) src, d, ne0, ne1); break;
+        case GGML_TYPE_IQ4_NL: repack_iq4_nl_host((const block_iq4_nl *) src, d, ne0, ne1); break;
+        case GGML_TYPE_IQ4_XS: repack_iq4_xs_host((const block_iq4_xs *) src, d, ne0, ne1); break;
+        case GGML_TYPE_IQ3_S:  repack_iq3_s_host ((const block_iq3_s  *) src, d, ne0, ne1); break;
+        default: GGML_ABORT("unsupported repack type");
+    }
 }
 
 static void ggml_backend_cuda_repack_buffer_get_tensor(

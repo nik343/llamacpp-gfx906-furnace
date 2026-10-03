@@ -88,3 +88,8 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
 bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre);
 void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * up,
         ggml_tensor * pre, void * yq);
+
+// host-only hooks for tests/test-repack-host.cpp
+size_t ggml_cuda_repack_nbytes_for_test(ggml_type type, int64_t ne0, int64_t ne1);
+int    ggml_cuda_repack_eff_type_for_test(ggml_type type);
+void   ggml_cuda_repack_host_for_test(ggml_type type, const void * src, void * dst, int64_t ne0, int64_t ne1);

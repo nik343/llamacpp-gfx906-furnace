@@ -530,6 +530,18 @@ int main(int argc, char ** argv) {
         shapes.push_back({ "dense " + std::to_string(d[0]) + "x" + std::to_string(d[1]),
             GGML_TYPE_Q8_0, d[0], d[1], 0, 0, false, "" });
     }
+    // nibble-plane formats (Q4_0 now; the IQ4 family relabels onto the same kernels): the 27B/31B
+    // dense shapes plus a Gemma-31B-class FFN
+    const int64_t nib_dense[][2] = { { 5120, 17408 }, { 17408, 5120 }, { 5120, 6144 }, { 5376, 21504 }, { 2560, 6144 } };
+    for (const auto & d : nib_dense) {
+        for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K }) {
+            if (d[0] % 256 != 0 && t != GGML_TYPE_Q4_0 && t != GGML_TYPE_IQ4_NL) {
+                continue;
+            }
+            shapes.push_back({ "dense " + std::to_string(d[0]) + "x" + std::to_string(d[1]),
+                t, d[0], d[1], 0, 0, false, "" });
+        }
+    }
 
     FILE * fdump = nullptr;
     if (!p.dump.empty()) {
