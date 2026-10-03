@@ -4504,6 +4504,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // RMS_NORM -> SCALE (GDN l2 norm)
+    // the GDN q and k l2 norms: two RMS_NORM -> SCALE pairs back to back (views between) in one launch
+    if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+        static const bool no_norm_pair = getenv("GGML_CUDA_NO_NORM_PAIR_FUSION") != nullptr;
+        int j = i + 2;
+        while (!no_norm_pair && j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        if (!no_norm_pair && j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM &&
+                ggml_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
+                ggml_cuda_op_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+            return j + 1 - i;
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }) &&
             ggml_is_contiguous(cgraph->nodes[i + 1]) && ggml_cuda_fusion_inputs_ok(cgraph->nodes[i + 1], { node->src[0] }, {})) {
         ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
