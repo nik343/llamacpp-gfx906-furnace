@@ -49,10 +49,20 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst);
 
+// MUL_MAT_ID (repacked Q5_1 experts, one token) with the following router-weighted expert sum in one
+// kernel, writing the reduction's dst. false: not applicable, run the two ops separately.
+bool ggml_cuda_mul_mat_id_repacked_down_reduce(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst, bool copy_ids);
+
 // Fused gate+up GLU decode path (Q4_K, dense and MoE).
 // q8_1 buffer for a producing kernel to fill alongside tensor t (flat 32-value blocks), when t
 // feeds a single-column repacked matvec; the consumer then skips its quantize. nullptr: don't emit
-void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t);
+// q8_1 buffer for a producer kernel to write t's quantized blocks into (nullptr: no repacked consumer).
+// With id_blocks_per_row, a MUL_MAT_ID consumer is served too; it then holds the padded per-row stride
+// the producer must write (0 = flat layout for a MUL_MAT consumer).
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t,
+        int64_t * id_blocks_per_row = nullptr);
 
 // drop cached q8_1 activations whose source range node writes
 // (force: also entries this node produced itself)

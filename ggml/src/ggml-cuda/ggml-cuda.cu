@@ -4601,6 +4601,50 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // repacked MoE down projection -> router-weighted expert sum, one kernel (one token)
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer != nullptr &&
+            ggml_backend_buft_is_cuda_repack(node->src[0]->buffer->buft) && node->src[2]->ne[1] == 1 &&
+            i + 1 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1)) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+        static int dbg_left = 6;
+        const bool matched = ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match);
+        if (matched && match.experts == node) {
+            // the reduction's own range check (its inputs vs its output); the matmul's src1 may share
+            // memory with the output (it is dead after the matmul and the fused kernel reads only its
+            // quantized copy), but the weights and ids are read by the fused kernel
+            const int output_idx = i + match.node_count;
+            auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+                const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+                return a0 < b1 && b0 < a1;
+            };
+            // ids may share memory with dst (the allocator reuses the dead routing buffer): the fused
+            // kernel then reads a copy. The expert weights live in the repack buffer.
+            const bool red_ok  = ggml_cuda_check_fusion_memory_ranges(cgraph, i + 1, match.node_count, &output_idx, 1);
+            const bool ids_ovl = overlap(match.dst, node->src[2]);
+            const bool mem_ok  = red_ok && !overlap(match.dst, node->src[0]);
+            const bool launched = mem_ok && ggml_cuda_mul_mat_id_repacked_down_reduce(*cuda_ctx, node->src[0], node->src[1],
+                node->src[2], match.weights, match.expert_scale, match.dst, ids_ovl);
+            if (dbg && dbg_left > 0 && !launched) {
+                dbg_left--;
+                fprintf(stderr, "down_reduce: %s (%s %ldx%ldx%ld) next %s: red_ok=%d ids_ovl=%d w_ovl=%d launched=%d n_used=%ld src1 [%ld,%ld,%ld]\n",
+                    node->name, ggml_type_name(node->src[0]->type), (long) node->src[0]->ne[0], (long) node->src[0]->ne[1],
+                    (long) node->src[0]->ne[2], ggml_op_name(cgraph->nodes[i + 1]->op), (int) red_ok, (int) ids_ovl,
+                    (int) overlap(match.dst, node->src[0]), (int) launched,
+                    (long) node->src[2]->ne[0], (long) node->src[1]->ne[0], (long) node->src[1]->ne[1], (long) node->src[1]->ne[2]);
+            }
+            if (launched) {
+                return match.node_count;
+            }
+        } else if (dbg && dbg_left > 0) {
+            dbg_left--;
+            fprintf(stderr, "down_reduce: %s next %s (%s): matched=%d experts_eq=%d uses1=%d\n", node->name,
+                cgraph->nodes[i + 1]->name, ggml_op_name(cgraph->nodes[i + 1]->op), (int) matched,
+                (int) (matched && match.experts == node), (int) ggml_node_has_n_uses(cgraph, i, 1));
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
