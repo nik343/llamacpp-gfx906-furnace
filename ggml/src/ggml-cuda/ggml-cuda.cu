@@ -1783,10 +1783,11 @@ static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
 #define GCN_F32_RB_BN 64
 #define GCN_F32_RB_BK 16
 
+// k in [k_begin, K): the whole range for the plain GEMM, one slice for split-K
 template <bool VEC>
-static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
+static __device__ __forceinline__ void gcn_f32_gemm_tn_rb_body(
         const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
-        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc, const int k_begin) {
     __shared__ float As[GCN_F32_RB_BK][GCN_F32_RB_BM + 4];
     __shared__ float Bs[GCN_F32_RB_BK][GCN_F32_RB_BN + 4];
 
@@ -1802,7 +1803,7 @@ static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
 
     float acc[4][4] = {{0.0f}};
 
-    for (int k0 = 0; k0 < K; k0 += GCN_F32_RB_BK) {
+    for (int k0 = k_begin; k0 < K; k0 += GCN_F32_RB_BK) {
         const int k = k0 + lk;
         float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1860,6 +1861,38 @@ static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
             }
         }
     }
+}
+
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C, M, N, K, lda, ldb, ldc, 0);
+}
+
+// Split-K (from reinstinct, crossport R8): blockIdx.z takes k in [z*k_chunk, min(K, (z+1)*k_chunk)) and
+// writes its partial C to C + z*split_stride; gcn_f32_splitk_reduce sums the slices in z order
+// (deterministic). For skinny GEMMs (MoE router, GDN alpha/beta) that give a few tiles on 60 CUs.
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb_splitk(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const int k_chunk, const int64_t split_stride) {
+    const int kb = blockIdx.z * k_chunk;
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C + (size_t) blockIdx.z * split_stride, M, N, min(K, kb + k_chunk), lda, ldb, ldc, kb);
+}
+
+static __global__ void __launch_bounds__(256) gcn_f32_splitk_reduce(
+        const float * __restrict__ part, float * __restrict__ y, const int64_t n, const int splits) {
+    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float acc = part[i];
+    for (int z = 1; z < splits; z++) {
+        acc += part[(size_t) z * n + i];
+    }
+    y[i] = acc;
 }
 
 // Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
@@ -2116,6 +2149,30 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             const dim3 grid((ne11 + GCN_F32_RB_BN - 1) / GCN_F32_RB_BN, (ne01 + GCN_F32_RB_BM - 1) / GCN_F32_RB_BM);
             const bool vec = s01 % 4 == 0 && s11 % 4 == 0 &&
                 (uintptr_t) src0_ptr % 16 == 0 && (uintptr_t) src1_ptr % 16 == 0;
+            // skinny problems: split K until ~2 tiles per CU, each slice >= 128 deep
+            static const bool no_splitk = getenv("GGML_CUDA_NO_F32_SPLITK") != nullptr;
+            int splits = 1;
+            while (!no_splitk && (int64_t) grid.x * grid.y * splits < 120 && ne10 / (2 * splits) >= 128) {
+                splits *= 2;
+            }
+            if (splits > 1) {
+                const int k_chunk = (int) ((((ne10 + splits - 1) / splits) + GCN_F32_RB_BK - 1) / GCN_F32_RB_BK * GCN_F32_RB_BK);
+                const int64_t n_out = (int64_t) ne0 * ne11;
+                ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) n_out * splits);
+                const dim3 gridz(grid.x, grid.y, splits);
+                if (vec) {
+                    gcn_f32_gemm_tn_rb_splitk<true><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0, k_chunk, n_out);
+                } else {
+                    gcn_f32_gemm_tn_rb_splitk<false><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0, k_chunk, n_out);
+                }
+                gcn_f32_splitk_reduce<<<(n_out + 255) / 256, 256, 0, main_stream>>>(part.get(), (float *) dst_ptr, n_out, splits);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
             if (vec) {
                 gcn_f32_gemm_tn_rb<true><<<grid, block, 0, main_stream>>>(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
