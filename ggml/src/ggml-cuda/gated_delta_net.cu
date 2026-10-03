@@ -564,6 +564,36 @@ bool ggml_cuda_gdn_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_
     if (user == nullptr || ggml_nelements(user->src[5]) != ggml_nelements(gr)) {
         return false;
     }
+    // The GDN launch reads the gather's row indices, but the allocator keeps them alive only up to the
+    // gather itself: a node scheduled between the two, or the GDN output, may reuse their memory (the
+    // qwen35 graph computes gate/beta there; a single-token first ubatch then read garbage rows and
+    // faulted). Keep the elision only when nothing from the gather to the GDN overlaps the indices.
+    {
+        const ggml_tensor * ids = gr->src[1];
+        const char * i0 = (const char *) ids->data;
+        const char * i1 = i0 + ggml_nbytes(ids);
+        bool after_gr = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (n == gr) {
+                after_gr = true;
+                continue;
+            }
+            if (!after_gr) {
+                continue;
+            }
+            if (n->view_src == nullptr && n->data != nullptr) {
+                const char * a0 = (const char *) n->data;
+                const char * a1 = a0 + ggml_nbytes(n);
+                if (a0 < i1 && i0 < a1) {
+                    return false;
+                }
+            }
+            if (n == user) {
+                break;
+            }
+        }
+    }
     // The fused cache write-back stores sequence a's state into row kv_head + a in the same launch that
     // reads sequence b's state from row state_rows[b]. Fresh sequences all read the zero row rs_z, which
     // is one of their destination rows, so a prompt ubatch with several sequences read a state another
