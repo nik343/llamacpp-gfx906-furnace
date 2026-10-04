@@ -611,6 +611,13 @@ static __global__ void __launch_bounds__(1024, 1) repack_tile_map(
     }
 }
 
+// GGML_CUDA_NO_KQ_HOIST=1: dense Q4_K/Q5_K/Q6_K matvecs and the dense Q4_K GLU run the pre-R10a
+// guarded per-row loop (A/B switch for the clamp + hoisted-load change).
+static bool kq_hoist() {
+    static const bool h = getenv("GGML_CUDA_NO_KQ_HOIST") == nullptr;
+    return h;
+}
+
 // GGML_CUDA_NO_Q4K_FENCE=1: drop the scheduling barrier after the hoisted loads in the dense Q4_K
 // matvec / GLU (crossport P1b: without it the scheduler splits each trip into load / wait / dot;
 // 78 -> 70 us on 17408x5120). Only Q4_K: it did nothing on Q8_0 and hurt Q6_K / Q4_0.
@@ -629,7 +636,7 @@ static bool q4k_fence() {
 // with (dx, sx) = block_q8_1.ds — sx is dx * sum(q8), which is exactly
 // the dequantized sub-block sum the min-term needs (same contract as
 // vec_dot_q4_K_q8_1).
-template <bool HAS_IDS, bool FENCE = false>
+template <bool HAS_IDS, bool FENCE = false, bool HOIST = true>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -679,6 +686,32 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         const float sx = __high2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
+        if constexpr (HAS_IDS || !HOIST) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const uint4    q  = nib[(size_t) row * nsp + sb];
+            const uint16_t sm = smp[(size_t) row * nsp + sb];
+            const uint32_t dd = ddp[(size_t) row * n_super + (sb >> 3)];
+            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm & 0xFFu);
+            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+            const int j1 = HAS_IDS ? j0 + 2          : 4;
+            int idot = 0;
+#pragma unroll
+            for (int j = j0; j < j1; j++) {
+                idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+            }
+            acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+        }
+        } else {
         // rows clamped (not branched) so both rows' planes are in flight before the first dot;
         // the store below is masked (crossport R10)
         uint4    q[ROWS];
@@ -710,6 +743,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
                 idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
             }
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+        }
         }
     }
 
@@ -758,7 +792,7 @@ static __device__ __forceinline__ uint32_t repack_spread1_hi(const uint32_t h) {
 
 // Q5_K repacked matvec — Q4_K's shape plus the qh plane OR-ed onto the
 // nibbles before each dp4a.
-template <bool HAS_IDS>
+template <bool HAS_IDS, bool HOIST = true>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -806,6 +840,36 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         const float sx = __high2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
+        if constexpr (HAS_IDS || !HOIST) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const size_t   idx = (size_t) row * nsp + sb;
+            const uint4    q   = nib[idx];
+            const uint32_t qh  = qhp[idx];
+            const uint16_t sm  = smp[idx];
+            const uint32_t dd  = ddp[(size_t) row * n_super + (sb >> 3)];
+            const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+            const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm & 0xFFu);
+            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+            const int j1 = HAS_IDS ? j0 + 2          : 4;
+            int idot = 0;
+#pragma unroll
+            for (int j = j0; j < j1; j++) {
+                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu);
+                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
+                idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
+                idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+            }
+            acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+        }
+        } else {
         uint4    q[ROWS];
         uint32_t qh[ROWS];
         uint16_t sm[ROWS];
@@ -837,6 +901,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
                 idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
             }
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+        }
         }
     }
 
@@ -1409,7 +1474,7 @@ static void launch_mul_mat_vec_q5_1_repacked_seg(
 // Q6_K repacked matvec. Symmetric quant (value = q-32); the offset is
 // folded out via activation half-sums: sum (q-32)x = sum qx - 32 sum x.
 // Two signed scales per sub-block, one per 16 weights.
-template <bool HAS_IDS>
+template <bool HAS_IDS, bool HOIST = true>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1466,6 +1531,39 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
             xis1 = ggml_cuda_dp4a(xq32[j + 4], 0x01010101, xis1);
         }
 
+        if constexpr (HAS_IDS || !HOIST) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const size_t   idx  = (size_t) row * nsp + sb;
+            const uint4    q    = nib[idx];
+            const uint32_t h2lo = h2p[idx * 2];
+            const uint32_t h2hi = h2p[idx * 2 + 1];
+            const uint16_t sm     = smp[idx];
+            const uint16_t d_bits = ddp[(size_t) row * n_super + (sb >> 3)];
+            const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
+            const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+            int idot0 = 0, idot1 = 0;
+#pragma unroll
+            for (int j = hj0; j < hj1; j++) {
+                const uint32_t ge = 2 * j;
+                const uint32_t go = 2 * j + 1;
+                const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
+                const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
+                const uint32_t q6lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he);
+                const uint32_t q6hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho);
+                idot0 = ggml_cuda_dp4a((int) q6lo, xq32[j],     idot0);
+                idot1 = ggml_cuda_dp4a((int) q6hi, xq32[j + 4], idot1);
+            }
+            acc[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
+                    + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+        }
+        } else {
         uint4    q[ROWS];
         uint2    h2[ROWS];
         uint16_t sm[ROWS];
@@ -1502,6 +1600,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
             }
             acc[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
                     + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+        }
         }
     }
 
@@ -1963,7 +2062,7 @@ static void launch_mul_mat_vec_q8_0_repacked_seg(
     }
 }
 
-template <int ROWS, int NWAVES, bool HAS_IDS>
+template <int ROWS, int NWAVES, bool HAS_IDS, bool HOIST = true>
 static __global__ void mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -2010,6 +2109,24 @@ static __global__ void mul_mat_vec_q8_0_repacked(
         const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs) + half * 4;
 
+        if constexpr (HAS_IDS || !HOIST) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const int row = row0 + r;
+            if (row >= (int) ne1) {
+                continue;
+            }
+            const int      * w_int = qs_int + ((size_t) row * nsp + sb) * 8 + half * 4;
+            const uint16_t   db    = d_plane[(size_t) row * nsp + sb];
+            const float      dw    = __half2float(*reinterpret_cast<const __half *>(&db));
+            int idot = 0;
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                idot = ggml_cuda_dp4a(w_int[g], xq32[g], idot);
+            }
+            acc[r] += dw * dx * (float) idot;
+        }
+        } else {
         int4     w[ROWS];
         uint16_t db[ROWS];
 #pragma unroll
@@ -2027,6 +2144,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
             idot = ggml_cuda_dp4a(w[r].z, xq32[2], idot);
             idot = ggml_cuda_dp4a(w[r].w, xq32[3], idot);
             acc[r] += dw * dx * (float) idot;
+        }
         }
     }
 
@@ -2052,7 +2170,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 // 35B-A3B). Used for both dense MUL_MAT (ids == nullptr) and
 // MUL_MAT_ID decode. ID path uses half-sub-block units (small-K expert
 // tensors; min term on the even half).
-template <bool HAS_IDS, int ROWS = 2, int MIN_BLOCKS = 1, bool FENCE = false>
+template <bool HAS_IDS, int ROWS = 2, int MIN_BLOCKS = 1, bool FENCE = false, bool HOIST = true>
 static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repacked_glu(
         const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
         const block_q8_1 * __restrict__ xq, float * __restrict__ y,
@@ -2092,6 +2210,38 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
         const float sx = __high2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
+        if constexpr (HAS_IDS || !HOIST) {
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
+            const uint16_t * smp = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
+            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const int row = row0 + r;
+                if (row >= (int) ne1) {
+                    continue;
+                }
+                const uint4    q  = nib[(size_t) row * nsp + sb];
+                const uint16_t sm = smp[(size_t) row * nsp + sb];
+                const uint32_t dd = ddp[(size_t) row * n_super + (sb >> 3)];
+                const uint16_t d_bits    = (uint16_t)(dd & 0xFFFF);
+                const uint16_t dmin_bits = (uint16_t)(dd >> 16);
+                const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm & 0xFFu);
+                const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
+                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                const int j0 = HAS_IDS ? (int)(half * 2) : 0;
+            const int j1 = HAS_IDS ? j0 + 2          : 4;
+                int idot = 0;
+#pragma unroll
+                for (int j = j0; j < j1; j++) {
+                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
+                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                }
+                acc[w2][r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
+            }
+        }
+        } else {
         // both slabs' rows loaded before the first dot; rows clamped, store masked (crossport R10)
         uint4    q[2][ROWS];
         uint16_t sm[2][ROWS];
@@ -2131,6 +2281,7 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
                 }
                 acc[w2][r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
             }
+        }
         }
     }
 
@@ -2545,6 +2696,27 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked_glu16_ded
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// MMQ activation block as staged in LDS: 40 B with qs 8 B-aligned (crossport finding: the 36 B
+// block_q8_1 leaves qs 4 B-aligned, so every activation word read split into b32 pairs; with 5
+// blocks per token row the 200 B row stride also keeps b64 reads conflict-free) and the scales
+// already widened, one conversion per block at staging instead of per inner-loop iteration.
+struct __align__(8) mmq_x8 {
+    float  d;
+    float  s;
+    int8_t qs[32];
+};
+static_assert(sizeof(mmq_x8) == 40, "mmq_x8 is 40 bytes");
+static __device__ __forceinline__ void mmq_x8_stage(mmq_x8 & dst, const block_q8_1 & src) {
+    dst.d = __low2float(src.ds);
+    dst.s = __high2float(src.ds);
+    const int * q = reinterpret_cast<const int *>(src.qs);
+    int * o = reinterpret_cast<int *>(dst.qs);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        o[j] = q[j];
+    }
+}
+
 // int8 MMQ tile GEMM straight from the repacked planes (prefill path).
 // Y[tok, row] = Xq8[tok, :] . W[row, :] without dequantizing W.
 //
@@ -2605,9 +2777,9 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
     const uint32_t * ddp = reinterpret_cast<const uint32_t *>(
         wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
 
-    __shared__ uint4      sW [MMQ_RP_BM][MMQ_RP_BK];     // packed nibbles
-    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK];     // (dsc, deff)
-    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1]; // int8 activations
+    __shared__ uint4      sW [MMQ_RP_BM][MMQ_RP_BK + 1];     // packed nibbles
+    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK + 1];     // (dsc, deff)
+    __shared__ mmq_x8 sX [(16 * TN_)][MMQ_RP_BK + 1]; // int8 activations
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -2656,12 +2828,12 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             }
             if (xval && sb0 + xlk < n_sub) {
                 if constexpr (HAS_IDS) {
-                    sX[xlr][xlk] = xq[xoff + sb0 + xlk];
+                    mmq_x8_stage(sX[xlr][xlk], xq[xoff + sb0 + xlk]);
                 } else {
-                    sX[xlr][xlk] = xq[(size_t) (tok0 + xlr) * x_stride + sb0 + xlk];
+                    mmq_x8_stage(sX[xlr][xlk], xq[(size_t) (tok0 + xlr) * x_stride + sb0 + xlk]);
                 }
             } else {
-                sX[xlr][xlk].ds = make_half2(0.0f, 0.0f);
+                sX[xlr][xlk].d = 0.0f; sX[xlr][xlk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -2679,10 +2851,10 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             }
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
-                const float sx = __high2float(xb->ds);
+                const float dx = xb->d;
+                const float sx = xb->s;
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
                     const uint32_t qa[4] = { wq[r].x, wq[r].y, wq[r].z, wq[r].w };
@@ -2923,9 +3095,9 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
         wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
 
     // int8 weights per (row, sub-block), 5th bit folded in at staging (see the Q5_1 kernel)
-    __shared__ int        sW8 [MMQ_RP_BM][MMQ_RP_BK][8];
-    __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX  [(16 * TN_)][MMQ_RP_BK + 1];
+    __shared__ __align__(16) int sW8[MMQ_RP_BM][MMQ_RP_BK * 8 + 4]; // 144 B rows: 2-way instead of 16-way bank conflicts
+    __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ mmq_x8 sX  [(16 * TN_)][MMQ_RP_BK + 1];
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -2954,8 +3126,8 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
 #pragma unroll
             for (int j = 0; j < 4; j++) {
-                sW8[lr][lk][j]     = (int) (( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu));
-                sW8[lr][lk][4 + j] = (int) (((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu));
+                sW8[lr][lk * 8 + j]     = (int) (( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu));
+                sW8[lr][lk * 8 + 4 + j] = (int) (((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu));
             }
             const uint16_t sm = smp[(size_t) wrow * nsp + sb];
             const uint32_t dd = ddp[(size_t) wrow * n_super + (sb >> 3)];
@@ -2967,7 +3139,7 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
         } else {
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                sW8[lr][lk][j] = 0;
+                sW8[lr][lk * 8 + j] = 0;
             }
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
@@ -2977,12 +3149,12 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             }
             if (xval && sb < n_sub) {
                 if constexpr (HAS_IDS) {
-                    sX[lr][lk] = xq[xoff + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[xoff + sb]);
                 } else {
-                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[(size_t) (tok0 + lr) * x_stride + sb]);
                 }
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[lr][lk].d = 0.0f; sX[lr][lk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -2991,13 +3163,13 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
-                const float sx = __high2float(xb->ds);
+                const float dx = xb->d;
+                const float sx = xb->s;
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
-                    const int * w8 = sW8[ty + r * 16][kk];
+                    const int * w8 = &sW8[ty + r * 16][kk * 8];
                     int idot = 0;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
@@ -3078,9 +3250,9 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
     const half2    * dmp = reinterpret_cast<const half2 *>(wbase + (size_t) ne1 * nsp * 20);
 
     // int8 weights per (row, sub-block): [j] = weights 4j..4j+3, [4+j] = weights 16+4j..16+4j+3
-    __shared__ int        sW8[MMQ_RP_BM][MMQ_RP_BK][8];
-    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1];
+    __shared__ __align__(16) int sW8[MMQ_RP_BM][MMQ_RP_BK * 8 + 4]; // 144 B rows: 2-way instead of 16-way bank conflicts
+    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ mmq_x8 sX [(16 * TN_)][MMQ_RP_BK + 1];
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -3110,14 +3282,14 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
 #pragma unroll
             for (int j = 0; j < 4; j++) {
-                sW8[lr][lk][j]     = (int) (( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu));
-                sW8[lr][lk][4 + j] = (int) (((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu));
+                sW8[lr][lk * 8 + j]     = (int) (( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu));
+                sW8[lr][lk * 8 + 4 + j] = (int) (((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu));
             }
             sWs[lr][lk] = __half22float2(dmp[idx]);
         } else {
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                sW8[lr][lk][j] = 0;
+                sW8[lr][lk * 8 + j] = 0;
             }
             sWs[lr][lk] = make_float2(0.0f, 0.0f);
         }
@@ -3127,12 +3299,12 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
             }
             if (xval && sb < n_sub) {
                 if constexpr (HAS_IDS) {
-                    sX[lr][lk] = xq[xoff + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[xoff + sb]);
                 } else {
-                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[(size_t) (tok0 + lr) * x_stride + sb]);
                 }
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[lr][lk].d = 0.0f; sX[lr][lk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -3141,13 +3313,13 @@ static __global__ void __launch_bounds__(256, HAS_IDS ? MMQ_RP_OCC_ID : 2) mmq_g
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
-                const float sx = __high2float(xb->ds);
+                const float dx = xb->d;
+                const float sx = xb->s;
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
-                    const int * w8 = sW8[ty + r * 16][kk];
+                    const int * w8 = &sW8[ty + r * 16][kk * 8];
                     int idot = 0;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
@@ -3208,9 +3380,9 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_nib_repacked(
     const uint4    * nib = reinterpret_cast<const uint4 *>(wbase);
     const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 16);
 
-    __shared__ int        sW8[MMQ_RP_BM][MMQ_RP_BK][8];
-    __shared__ float      sWs[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1];
+    __shared__ __align__(16) int sW8[MMQ_RP_BM][MMQ_RP_BK * 8 + 4]; // 144 B rows: 2-way instead of 16-way bank conflicts
+    __shared__ float      sWs[MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ mmq_x8 sX [(16 * TN_)][MMQ_RP_BK + 1];
 
     float acc[MMQ_RP_TM][TN_] = {};
     const int lr = t >> 2;
@@ -3226,22 +3398,22 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_nib_repacked(
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
 #pragma unroll
             for (int j = 0; j < 4; j++) {
-                repack_nib_decode<MODE>(qa[j], sW8[lr][lk][j], sW8[lr][lk][4 + j]);
+                repack_nib_decode<MODE>(qa[j], sW8[lr][lk * 8 + j], sW8[lr][lk * 8 + 4 + j]);
             }
             const uint16_t db = dp[idx];
             sWs[lr][lk] = __half2float(*reinterpret_cast<const __half *>(&db));
         } else {
 #pragma unroll
             for (int j = 0; j < 8; j++) {
-                sW8[lr][lk][j] = 0;
+                sW8[lr][lk * 8 + j] = 0;
             }
             sWs[lr][lk] = 0.0f;
         }
         if (xstage) {
             if (tok0 + lr < n_tok && sb < n_sub) {
-                sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                mmq_x8_stage(sX[lr][lk], xq[(size_t) (tok0 + lr) * x_stride + sb]);
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[lr][lk].d = 0.0f; sX[lr][lk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -3250,12 +3422,12 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_nib_repacked(
         for (int kk = 0; kk < MMQ_RP_BK; kk++) {
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
+                const float dx = xb->d;
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
-                    const int * w8 = sW8[ty + r * 16][kk];
+                    const int * w8 = &sW8[ty + r * 16][kk * 8];
                     int idot = 0;
 #pragma unroll
                     for (int j = 0; j < 8; j++) {
@@ -3335,10 +3507,10 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
     const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
         wbase + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 2);
 
-    __shared__ uint4      sWlo[MMQ_RP_BM][MMQ_RP_BK]; // int8 (q6 - 32), weights 0-15
-    __shared__ uint4      sWhi[MMQ_RP_BM][MMQ_RP_BK]; // int8 (q6 - 32), weights 16-31
-    __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX  [(16 * TN_)][MMQ_RP_BK + 1];
+    __shared__ uint4      sWlo[MMQ_RP_BM][MMQ_RP_BK + 1]; // int8 (q6 - 32), weights 0-15
+    __shared__ uint4      sWhi[MMQ_RP_BM][MMQ_RP_BK + 1]; // int8 (q6 - 32), weights 16-31
+    __shared__ float2     sWs [MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ mmq_x8 sX  [(16 * TN_)][MMQ_RP_BK + 1];
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -3393,12 +3565,12 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
             }
             if (xval && sb < n_sub) {
                 if constexpr (HAS_IDS) {
-                    sX[lr][lk] = xq[xoff + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[xoff + sb]);
                 } else {
-                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[(size_t) (tok0 + lr) * x_stride + sb]);
                 }
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[lr][lk].d = 0.0f; sX[lr][lk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -3417,9 +3589,9 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q6k_repacked(
             }
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
+                const float dx = xb->d;
 #pragma unroll
                 for (int r = 0; r < MMQ_RP_TM; r++) {
                     const int lo[4] = { (int) wlo[r].x, (int) wlo[r].y, (int) wlo[r].z, (int) wlo[r].w };
@@ -3508,10 +3680,10 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
     const uint16_t * ddp = reinterpret_cast<const uint16_t *>(
         wbase + (size_t) ne1 * nsp * 8 + (size_t) ne1 * nsp * 4 + (size_t) ne1 * nsp * 2);
 
-    __shared__ uint2      sWl[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ uint32_t   sWh[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK];
-    __shared__ block_q8_1 sX [(16 * TN_)][MMQ_RP_BK + 1];
+    __shared__ uint2      sWl[MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ uint32_t   sWh[MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ float2     sWs[MMQ_RP_BM][MMQ_RP_BK + 1];
+    __shared__ mmq_x8 sX [(16 * TN_)][MMQ_RP_BK + 1];
 
     float acc[MMQ_RP_TM][TN_] = {};
 
@@ -3551,12 +3723,12 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
             }
             if (xval && sb < n_sub) {
                 if constexpr (HAS_IDS) {
-                    sX[lr][lk] = xq[xoff + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[xoff + sb]);
                 } else {
-                    sX[lr][lk] = xq[(size_t) (tok0 + lr) * x_stride + sb];
+                    mmq_x8_stage(sX[lr][lk], xq[(size_t) (tok0 + lr) * x_stride + sb]);
                 }
             } else {
-                sX[lr][lk].ds = make_half2(0.0f, 0.0f);
+                sX[lr][lk].d = 0.0f; sX[lr][lk].s = 0.0f;
             }
         }
         __syncthreads();
@@ -3575,9 +3747,9 @@ static __global__ void __launch_bounds__(256, 2) mmq_gemm_q3k_repacked(
             }
 #pragma unroll
             for (int n = 0; n < TN_; n++) {
-                const block_q8_1 * xb = &sX[tx + n * 16][kk];
+                const mmq_x8 * xb = &sX[tx + n * 16][kk];
                 const int * xq32 = reinterpret_cast<const int *>(xb->qs);
-                const float dx = __low2float(xb->ds);
+                const float dx = xb->d;
                 int xis0 = 0, xis1 = 0;
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
@@ -4647,7 +4819,10 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_Q4_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                if (q4k_fence()) {
+                if (!kq_hoist()) {
+                    mul_mat_vec_q4k_repacked<false, false, false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } else if (q4k_fence()) {
                     mul_mat_vec_q4k_repacked<false, true><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
                 } else {
@@ -4657,15 +4832,23 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q5k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                if (kq_hoist()) {
+                    mul_mat_vec_q5k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } else {
+                    mul_mat_vec_q5k_repacked<false, false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                }
             } break;
             case GGML_TYPE_Q6_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_q6k_repacked<false><<<grid, 256, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                if (kq_hoist()) {
+                    mul_mat_vec_q6k_repacked<false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } else {
+                    mul_mat_vec_q6k_repacked<false, false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                }
             } break;
             case GGML_TYPE_Q5_1: {
                 if (ne00 <= 1024) {
@@ -4717,6 +4900,14 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 }
                 if (ne01 >= 512) {
                     const dim3 grid(ne01, 1, 1);
+                    // the hoisted loop wins at K <= 3072 (2560x10240: 74 -> 57 us) and loses at K = 4096
+                    // (2816 rows: +4% here, +30% on a second MI50), so it is K-gated; GGML_CUDA_NO_Q8_HOIST=1 off
+                    static const bool no_q8_hoist = getenv("GGML_CUDA_NO_Q8_HOIST") != nullptr;
+                    if (no_q8_hoist || ne00 > 3072) {
+                        mul_mat_vec_q8_0_repacked<1, 1, false, false><<<grid, 64, 0, stream>>>(
+                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                        break;
+                    }
                     mul_mat_vec_q8_0_repacked<1, 1, false><<<grid, 64, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                         nullptr, nullptr, nullptr, 0, 0, 0, 0);
@@ -4728,6 +4919,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     // is 238.0 — the residual ~3% is why Q8_0 stays
                     // behind its own env gate)
                     const dim3 grid((ne01 + 7) / 8, 1, 1);
+                    static const bool no_q8_hoist2 = getenv("GGML_CUDA_NO_Q8_HOIST") != nullptr;
+                    if (no_q8_hoist2 || ne00 > 3072) {
+                        mul_mat_vec_q8_0_repacked<2, 4, false, false><<<grid, 256, 0, stream>>>(
+                            w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                        break;
+                    }
                     mul_mat_vec_q8_0_repacked<2, 4, false><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                         nullptr, nullptr, nullptr, 0, 0, 0, 0);
@@ -5425,7 +5622,10 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
             return;
         }
         const dim3 grid((ne01 + 7) / 8, 1, 1);
-        if (q4k_fence()) {
+        if (!kq_hoist()) {
+            mul_mat_vec_q4k_repacked_glu<false, 2, 1, false, false><<<grid, 256, 0, stream>>>(
+                wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+        } else if (q4k_fence()) {
             mul_mat_vec_q4k_repacked_glu<false, 2, 1, true><<<grid, 256, 0, stream>>>(
                 wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op, nullptr, nullptr, nullptr, 0, 0, 0, 0);
         } else {
