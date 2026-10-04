@@ -3355,6 +3355,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t) {
+    return ggml_cuda_is_view_or_noop(t);
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -4479,6 +4483,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CONCAT) {
+        const int n = ggml_cuda_try_conv_step_fusion(*cuda_ctx, cgraph, i);
+        if (n >= 0) {
+            return n;
+        }
+    }
 
     if (node->op == GGML_OP_GET_ROWS) {
         static const bool no_qsa_pool = getenv("GGML_CUDA_NO_QSA_POOL") != nullptr;
@@ -5739,8 +5750,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // a recurrent-state gather read in place by its gated_delta_net
-                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_elidable(cgraph, node)) {
+                // a recurrent-state gather read in place by its gated_delta_net or its fused conv step
+                if (node->op == GGML_OP_GET_ROWS && (ggml_cuda_gdn_state_gather_elidable(cgraph, node) ||
+                        ggml_cuda_conv_state_gather_elidable(cgraph, node))) {
                     continue;
                 }
 
