@@ -49,14 +49,27 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst);
 
+// MUL_MAT_ID (repacked Q5_1 experts, one token) with the following router-weighted expert sum in one
+// kernel, writing the reduction's dst. false: not applicable, run the two ops separately.
+bool ggml_cuda_mul_mat_id_repacked_down_reduce(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst, bool copy_ids);
+
 // Fused gate+up GLU decode path (Q4_K, dense and MoE).
 // q8_1 buffer for a producing kernel to fill alongside tensor t (flat 32-value blocks), when t
 // feeds a single-column repacked matvec; the consumer then skips its quantize. nullptr: don't emit
-void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t);
+// q8_1 buffer for a producer kernel to write t's quantized blocks into (nullptr: no repacked consumer).
+// With id_blocks_per_row, a MUL_MAT_ID consumer is served too; it then holds the padded per-row stride
+// the producer must write (0 = flat layout for a MUL_MAT consumer).
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t,
+        int64_t * id_blocks_per_row = nullptr);
 
 // drop cached q8_1 activations whose source range node writes
 // (force: also entries this node produced itself)
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false);
+// keep: also spare entries produced by this node (the last node of a fused group, whose q8_1 copy the
+// fused kernel wrote from final values; the group's elided intermediates may share its memory)
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node, bool force = false,
+        const ggml_tensor * keep = nullptr);
 
 bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
     const ggml_tensor * glu);
@@ -75,3 +88,8 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
 bool ggml_cuda_hc_up_pre_ok(const ggml_tensor * scale, const ggml_tensor * silu, const ggml_tensor * up, const ggml_tensor * pre);
 void ggml_cuda_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * scale, const ggml_tensor * up,
         ggml_tensor * pre, void * yq);
+
+// host-only hooks for tests/test-repack-host.cpp
+size_t ggml_cuda_repack_nbytes_for_test(ggml_type type, int64_t ne0, int64_t ne1);
+int    ggml_cuda_repack_eff_type_for_test(ggml_type type);
+void   ggml_cuda_repack_host_for_test(ggml_type type, const void * src, void * dst, int64_t ne0, int64_t ne1);

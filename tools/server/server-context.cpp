@@ -4256,6 +4256,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_video          */ impl->chat_params.allow_video,
         /* json_ui_settings       */ impl->json_ui_settings,
         /* slot_n_ctx             */ impl->n_ctx_slot(),
+        /* n_ctx_pool             */ (int) llama_n_ctx(impl->ctx_tgt),
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -4654,6 +4655,43 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
+// launch configuration, for dashboards: values the API does not otherwise expose
+static json get_res_server_config(const server_context_meta & meta, const common_params & params) {
+    json effort = nullptr;
+    const auto it = params.default_template_kwargs.find("reasoning_effort");
+    if (it != params.default_template_kwargs.end()) {
+        try {
+            effort = json::parse(it->second);
+        } catch (...) {
+            effort = it->second;
+        }
+    }
+    // --spec-type appends to the default {NONE}, so filter it out
+    std::vector<common_speculative_type> spec_types;
+    bool has_draft = false;
+    for (const auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+            spec_types.push_back(t);
+            has_draft |= common_speculative_type_to_str(t).rfind("draft", 0) == 0;
+        }
+    }
+    const bool has_spec = !spec_types.empty();
+    return json {
+        { "n_ctx",            meta.n_ctx_pool },
+        { "n_ctx_slot",       meta.slot_n_ctx },
+        { "n_parallel",       params.n_parallel },
+        { "kv_unified",       params.kv_unified },
+        { "n_threads",        params.cpuparams.n_threads },
+        { "n_threads_batch",  params.cpuparams_batch.n_threads },
+        { "n_batch",          params.n_batch },
+        { "n_ubatch",         params.n_ubatch },
+        { "spec_type",        has_spec  ? json(common_speculative_type_name_str(spec_types)) : json(nullptr) },
+        { "draft_n_max",      has_draft ? json(params.speculative.draft.n_max) : json(nullptr) },
+        { "draft_max_slots",  has_draft ? json(params.speculative.draft.max_slots) : json(nullptr) },
+        { "reasoning_effort", effort },
+    };
+}
+
 static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -4691,6 +4729,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "build_info",                  meta.build_info },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
+        { "server_config",               get_res_server_config(meta, params) },
     };
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {

@@ -16,7 +16,7 @@ Recently updated for Qwen-3.8-flash-next (9/28)
 
 Branches:
 
-- `gfx906-perf` (default): everything below. The retune rebased onto
+- `gfx906-perf` (default, the only branch): everything below. The retune rebased onto
   upstream e6ab7c1a4 (2026-09-22), the multi-GPU and qwen4exp work, and
   the qwen4exp NextN/MTP draft head (port of upstream PR #28243) with two
   fixes: the scheduler is re-reserved when the nextn output is switched
@@ -25,10 +25,13 @@ Branches:
   the target pipeline is not drained. A merge commit joins the earlier
   b9587-based history; each commit message carries its measured A/B
   numbers and validation. Updated 2026-09-30 with the pipeline,
-  correctness and adaptive-MTP round described below.
-- `gfx906-perf-upstream` and `qwen4exp-mtp`: the development branches the
-  default branch was assembled from (the kernel/server work without and
-  with the MTP head).
+  correctness and adaptive-MTP round, and 2026-10-04 with the kernel round
+  (rank top-k, MoE down+reduce, Q8_0 multi-column and K-mapped matvecs,
+  GDN/norm/conv-step fusions, split-K, Q4_0 / IQ4 / IQ3_S repack, Q3_K->Q6_K
+  relabel, MMQ LDS layout, thread-packed expert matvecs) that the furnace
+  production server runs. The former development branches
+  (`gfx906-perf-upstream`, `qwen4exp-mtp`, `gfx906-multislot-multicard`) were
+  merged here or superseded and removed.
 
 ## Single GPU
 

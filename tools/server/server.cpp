@@ -16,6 +16,9 @@
 #include <clocale>
 #include <exception>
 #include <signal.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include <thread> // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
@@ -29,8 +32,16 @@ static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
+#if !defined(_WIN32)
+        // write(2), not fprintf: async-signal-safe, no stdio lock the interrupted thread may hold
+        static const char msg[] = "Received second interrupt, terminating immediately.\n";
+        (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#else
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+#endif
+        // _exit, not exit: this runs inside a signal handler, and exit() would run TLS/atexit destructors
+        // (HIP's among them) that can block forever on a runtime lock held by the interrupted cleanup
+        _exit(1);
     }
 
     shutdown_handler(signal);

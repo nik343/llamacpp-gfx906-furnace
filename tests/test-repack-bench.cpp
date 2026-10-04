@@ -521,14 +521,41 @@ int main(int argc, char ** argv) {
     }
     for (const auto & r : moe_routings(false)) {
         shapes.push_back({ "moe_down 640x2560x512 [" + r + "]", GGML_TYPE_Q5_1, 640, 2560, 512, 10, false, r });
+        // Qwen 3.6-35B-A3B class experts: 128 experts, 8 used, K = 768 (24 sub-blocks)
+        shapes.push_back({ "moe_down 768x2048x128 [" + r + "]", GGML_TYPE_Q5_K, 768, 2048, 128, 8, false, r });
+        shapes.push_back({ "moe_down 768x2048x128 [" + r + "]", GGML_TYPE_Q6_K, 768, 2048, 128, 8, false, r });
+        shapes.push_back({ "moe_down 768x2048x128 [" + r + "]", GGML_TYPE_Q4_K, 768, 2048, 128, 8, false, r });
     }
     const int64_t dense[][2] = {
         { 2560, 10240 }, { 6144, 2560 }, { 2560, 6144 }, { 320, 10240 }, { 10240, 320 },
         { 2560, 12288 }, { 2560, 640 }, { 640, 2560 }, { 2560, 512 },
+        { 2816, 4096 }, { 2816, 2048 }, { 4096, 2816 }, { 2816, 2112 }, { 2112, 2816 }, // Gemma 26B-A4B dense
+        { 4096, 2048 }, { 2048, 4096 }, // Qwen 3.6-35B-A3B ssm_out / attn_output and in_proj class
+        { 2560, 248320 }, // Flash-Next LM head
     };
     for (const auto & d : dense) {
         shapes.push_back({ "dense " + std::to_string(d[0]) + "x" + std::to_string(d[1]),
             GGML_TYPE_Q8_0, d[0], d[1], 0, 0, false, "" });
+    }
+    // dense K-quants (27B / Gemma 31B shapes) for the R10 loads-first matvecs
+    const int64_t kq_dense[][2] = { { 5120, 17408 }, { 17408, 5120 }, { 5120, 6144 }, { 2560, 6144 } };
+    for (const auto & d : kq_dense) {
+        for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+            shapes.push_back({ "dense " + std::to_string(d[0]) + "x" + std::to_string(d[1]),
+                t, d[0], d[1], 0, 0, false, "" });
+        }
+    }
+    // nibble-plane formats (Q4_0 now; the IQ4 family relabels onto the same kernels): the 27B/31B
+    // dense shapes plus a Gemma-31B-class FFN
+    const int64_t nib_dense[][2] = { { 5120, 17408 }, { 17408, 5120 }, { 5120, 6144 }, { 5376, 21504 }, { 2560, 6144 } };
+    for (const auto & d : nib_dense) {
+        for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K }) {
+            if (d[0] % 256 != 0 && t != GGML_TYPE_Q4_0 && t != GGML_TYPE_IQ4_NL) {
+                continue;
+            }
+            shapes.push_back({ "dense " + std::to_string(d[0]) + "x" + std::to_string(d[1]),
+                t, d[0], d[1], 0, 0, false, "" });
+        }
     }
 
     FILE * fdump = nullptr;
